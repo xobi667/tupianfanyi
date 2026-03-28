@@ -1,4 +1,4 @@
-import { NextResponse } from 'next/server';
+﻿import { NextResponse } from 'next/server';
 import {
   buildGatewayHeaders,
   buildGatewayUrl,
@@ -19,50 +19,50 @@ function errorResponse(message: string, status = 400) {
 }
 
 function createLogPrefix(requestId: string) {
-  return `[网关请求 ${requestId}]`;
+  return `[???? ${requestId}]`;
 }
 
 function toChineseDebugLabel(label?: string) {
-  if (!label) return '未命名请求';
-  if (label === 'test-text-quick') return '快速测试 / 文本模型';
-  if (label === 'test-text-full') return '完整测试 / 文本模型';
-  if (label === 'test-image-full') return '完整测试 / 生图模型';
-  if (label === 'ocr-translate_and_remove') return '批量处理 / OCR 识别翻译 / 重绘翻译+去水印';
-  if (label === 'ocr-translate_only') return '批量处理 / OCR 识别翻译 / 翻译重绘';
-  if (label === 'image-translate_and_remove') return '批量处理 / 生图重绘 / 重绘翻译+去水印';
-  if (label === 'image-translate_only') return '批量处理 / 生图重绘 / 翻译重绘';
-  if (label === 'image-remove_only') return '批量处理 / 生图处理 / 仅去水印';
+  if (!label) return '?????';
+  if (label === 'test-text-quick') return '???? / ????';
+  if (label === 'test-text-full') return '???? / ????';
+  if (label === 'test-image-full') return '???? / ????';
+  if (label === 'ocr-translate_and_remove') return '???? / OCR ???? / ????+???';
+  if (label === 'ocr-translate_only') return '???? / OCR ???? / ????';
+  if (label === 'image-translate_and_remove') return '???? / ???? / ????+???';
+  if (label === 'image-translate_only') return '???? / ???? / ????';
+  if (label === 'image-remove_only') return '???? / ???? / ????';
   return label;
 }
 
 function toChineseAuthMode(authMode: string) {
-  if (authMode === 'x-goog-api-key') return '官方请求头 x-goog-api-key';
+  if (authMode === 'x-goog-api-key') return '????? x-goog-api-key';
   if (authMode === 'bearer') return 'Authorization: Bearer';
-  if (authMode === 'custom') return '自定义请求头';
-  if (authMode === 'query') return 'URL 参数';
+  if (authMode === 'custom') return '??????';
+  if (authMode === 'query') return 'URL ??';
   return authMode;
 }
 
 function toChineseContentsMode(contentsMode?: GatewayGenerateRequest['contentsMode']) {
   return contentsMode === 'object_parts'
-    ? '对象格式 contents[].parts'
-    : '角色格式 contents[].role + parts';
+    ? '???? contents[].parts'
+    : '???? contents[].role + parts';
 }
 
 function toChineseFinishReasons(finishReasons: string[]) {
   if (finishReasons.length === 0) {
-    return '无';
+    return '?';
   }
 
   return finishReasons
     .map((reason) => {
-      if (reason === 'STOP') return '正常结束';
-      if (reason === 'MAX_TOKENS') return '达到最大输出长度';
-      if (reason === 'SAFETY') return '触发安全限制';
-      if (reason === 'MALFORMED_FUNCTION_CALL') return '函数调用格式错误';
+      if (reason === 'STOP') return '????';
+      if (reason === 'MAX_TOKENS') return '????????';
+      if (reason === 'SAFETY') return '??????';
+      if (reason === 'MALFORMED_FUNCTION_CALL') return '????????';
       return reason;
     })
-    .join('、');
+    .join('?');
 }
 
 function summarizeParts(parts: GatewayGenerateRequest['parts']) {
@@ -344,19 +344,19 @@ export async function POST(request: Request) {
     const body = (await request.json()) as Partial<GatewayGenerateRequest>;
 
     if (!body || typeof body !== 'object') {
-      return errorResponse('Request body is required.');
+      return errorResponse('????????');
     }
 
     if (!body.settings) {
-      return errorResponse('Missing settings.');
+      return errorResponse('?? settings ???');
     }
 
     if (typeof body.model !== 'string' || !body.model.trim()) {
-      return errorResponse('Missing model name.');
+      return errorResponse('???????');
     }
 
     if (!Array.isArray(body.parts) || body.parts.length === 0) {
-      return errorResponse('Missing request parts.');
+      return errorResponse('???????');
     }
 
     const settings = normalizeSettings(body.settings, {
@@ -384,14 +384,14 @@ export async function POST(request: Request) {
     };
     const partSummary = summarizeParts(body.parts);
 
-    console.log(`${logPrefix} 开始请求`);
-    console.log(`${logPrefix} 请求分类: ${toChineseDebugLabel(body.debugLabel)}`);
-    console.log(`${logPrefix} 模型名称: ${body.model.trim()}`);
-    console.log(`${logPrefix} 请求地址: ${target.origin}${target.pathname}`);
-    console.log(`${logPrefix} Key 传递方式: ${toChineseAuthMode(settings.authMode)}`);
-    console.log(`${logPrefix} 内容格式: ${toChineseContentsMode(body.contentsMode)}`);
+    console.log(`${logPrefix} ????`);
+    console.log(`${logPrefix} ????: ${toChineseDebugLabel(body.debugLabel)}`);
+    console.log(`${logPrefix} ????: ${body.model.trim()}`);
+    console.log(`${logPrefix} ????: ${target.origin}${target.pathname}`);
+    console.log(`${logPrefix} Key ????: ${toChineseAuthMode(settings.authMode)}`);
+    console.log(`${logPrefix} ????: ${toChineseContentsMode(body.contentsMode)}`);
     console.log(
-      `${logPrefix} 文本片段数: ${partSummary.textParts}，图片片段数: ${partSummary.imageParts}`,
+      `${logPrefix} ?????: ${partSummary.textParts}??????: ${partSummary.imageParts}`,
     );
 
     if (shouldUseOpenAiImagePath(body, settings)) {
@@ -399,7 +399,7 @@ export async function POST(request: Request) {
       const openAiTarget = new URL(openAiUrl);
 
       console.log(
-        `${logPrefix} 正在尝试 OpenAI 兼容图片编辑地址: ${openAiTarget.origin}${openAiTarget.pathname}`,
+        `${logPrefix} ???? OpenAI ????????: ${openAiTarget.origin}${openAiTarget.pathname}`,
       );
 
       const upstreamResponse = await fetch(openAiUrl, {
@@ -414,13 +414,13 @@ export async function POST(request: Request) {
       const responseSummary = summarizeGatewayResponse(normalized);
       const durationMs = Date.now() - startedAt;
 
-      console.log(`${logPrefix} OpenAI 兼容图片编辑请求完成`);
-      console.log(`${logPrefix} 上游状态码: ${upstreamResponse.status}`);
-      console.log(`${logPrefix} 请求耗时: ${durationMs}ms`);
-      console.log(`${logPrefix} 结束原因: ${toChineseFinishReasons(responseSummary.finishReasons)}`);
-      console.log(`${logPrefix} 是否返回图片: ${responseSummary.hasImage ? '是' : '否'}`);
+      console.log(`${logPrefix} OpenAI ??????????`);
+      console.log(`${logPrefix} ?????: ${upstreamResponse.status}`);
+      console.log(`${logPrefix} ????: ${durationMs}ms`);
+      console.log(`${logPrefix} ????: ${toChineseFinishReasons(responseSummary.finishReasons)}`);
+      console.log(`${logPrefix} ??????: ${responseSummary.hasImage ? '?' : '?'}`);
       if (responseSummary.errorMessage) {
-        console.log(`${logPrefix} 上游错误信息: ${responseSummary.errorMessage}`);
+        console.log(`${logPrefix} ??????: ${responseSummary.errorMessage}`);
       }
 
       if (upstreamResponse.ok && normalized) {
@@ -442,7 +442,7 @@ export async function POST(request: Request) {
         });
       }
 
-      console.log(`${logPrefix} OpenAI 兼容地址不可用，回退到 generateContent`);
+      console.log(`${logPrefix} OpenAI ??????????? generateContent`);
     }
 
     const urlCandidates = buildUrlCandidates(target);
@@ -453,7 +453,7 @@ export async function POST(request: Request) {
       const currentUrl = new URL(candidateUrl);
 
       console.log(
-        `${logPrefix} 正在尝试 generateContent 地址 ${index + 1}/${urlCandidates.length}: ${currentUrl.origin}${currentUrl.pathname}`,
+        `${logPrefix} ???? generateContent ?? ${index + 1}/${urlCandidates.length}: ${currentUrl.origin}${currentUrl.pathname}`,
       );
 
       const upstreamResponse = await fetch(candidateUrl, {
@@ -470,13 +470,13 @@ export async function POST(request: Request) {
       const responseSummary = summarizeGatewayResponse(parsed);
       const durationMs = Date.now() - startedAt;
 
-      console.log(`${logPrefix} generateContent 请求完成`);
-      console.log(`${logPrefix} 上游状态码: ${upstreamResponse.status}`);
-      console.log(`${logPrefix} 请求耗时: ${durationMs}ms`);
-      console.log(`${logPrefix} 结束原因: ${toChineseFinishReasons(responseSummary.finishReasons)}`);
-      console.log(`${logPrefix} 是否返回图片: ${responseSummary.hasImage ? '是' : '否'}`);
+      console.log(`${logPrefix} generateContent ????`);
+      console.log(`${logPrefix} ?????: ${upstreamResponse.status}`);
+      console.log(`${logPrefix} ????: ${durationMs}ms`);
+      console.log(`${logPrefix} ????: ${toChineseFinishReasons(responseSummary.finishReasons)}`);
+      console.log(`${logPrefix} ??????: ${responseSummary.hasImage ? '?' : '?'}`);
       if (responseSummary.errorMessage) {
-        console.log(`${logPrefix} 上游错误信息: ${responseSummary.errorMessage}`);
+        console.log(`${logPrefix} ??????: ${responseSummary.errorMessage}`);
       }
 
       if (!upstreamResponse.ok) {
@@ -522,7 +522,7 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     if (isAbortLikeError(error)) {
-      console.log(`${createLogPrefix(requestId)} 请求已被前端取消或超时`);
+      console.log(`${createLogPrefix(requestId)} ???????????`);
       return new Response(null, {
         status: 499,
         headers: {
@@ -531,12 +531,12 @@ export async function POST(request: Request) {
       });
     }
 
-    console.error(`${createLogPrefix(requestId)} 请求异常`);
+    console.error(`${createLogPrefix(requestId)} ????`);
     console.error(
       `${createLogPrefix(requestId)} ${error instanceof Error ? error.message : String(error)}`,
     );
     return errorResponse(
-      error instanceof Error ? error.message : 'Server request failed.',
+      error instanceof Error ? error.message : '????????',
       500,
     );
   }
