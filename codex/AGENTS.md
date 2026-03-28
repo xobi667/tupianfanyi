@@ -141,3 +141,13 @@ Every small change should append a new entry instead of overwriting history.
   - accidentally overwrote the `codex` documents with incomplete placeholders
 - Final fix:
   - rebuilt `AGENTS.md` and `DEV.md` with the full record again
+
+### Entry 11
+
+- Trigger: Chinese text, README content, and logs were repeatedly broken by encoding mistakes and half-fixed rewrites.
+- Rule added:
+  - do not guess whether a file is fixed based on terminal rendering alone
+  - verify file content through unicode-safe inspection before claiming the fix is complete
+  - do not leave question marks, mojibake, or partial rewrites in user-facing docs or logs
+  - when in doubt, rewrite the affected file deterministically instead of patching blindly
+
