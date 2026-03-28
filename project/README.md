@@ -1,121 +1,124 @@
-﻿# 图片翻译器
+﻿# 图片翻译器 / Image Translator
 
-一个基于 Next.js 的图片翻译与重绘工具。
+一个基于 Next.js 的图片翻译与重绘工具。  
+A Next.js app for OCR, translation, and in-place redraw of text inside images.
 
-当前主流程是：
+![App Cover](public/showcase/hero-generated.jpg)
 
-1. 用文本模型做 OCR 和翻译
-2. 用图片模型在原图上原位替换文字
+## Showcase
 
-## 当前能力
+![Before After](public/showcase/workflow-generated.jpg)
 
-- 支持上传多张图片批量处理
-- 支持 OCR 识别主文案
-- 支持把原图中的文字翻译后原位替换
-- 支持下载单张结果或打包下载
-- 支持官方 Gemini 风格接口和部分兼容中转
+## 中文说明
 
-## 当前建议用法
+### 主要流程
 
-在你现在这组 relay / model 组合下，优先使用：
+1. 文本模型进行 OCR 识别与翻译
+2. 图片模型在原图版式中替换文字
 
-- `翻译重绘`
+### 功能特点
 
-这是目前最稳定的模式。
+- 批量上传图片
+- OCR 识别主文案
+- 翻译后原位重绘
+- 单张下载 / ZIP 打包下载
+- 支持兼容 Gemini 的 relay 接口
 
-`重绘翻译 + 去水印` 和 `仅去水印` 仍然保留，但是否稳定取决于你使用的图片模型和中转站兼容性。
-
-## 模型配置建议
-
-当前实测较合适的组合是：
+### 当前推荐配置
 
 - 文本模型：`gemini-3.1-flash-lite-preview`
 - 图片模型：`gemini-3.1-flash-image-preview`
 - 认证方式：`Bearer Token`
 
-说明：
+### 当前建议模式
 
-- 文本 OCR 请求仍走 Gemini 风格 `generateContent`
-- Bearer 图片编辑请求会优先走 OpenAI 兼容的 `/v1/chat/completions` 图片编辑路径
+优先使用：
 
-## 启动方式
+- `翻译重绘`
 
-### 推荐
-
-从仓库根目录双击：
-
-- `启动图片翻译器.bat`
-
-### 手动启动
-
-在当前目录执行：
+### 启动
 
 ```bash
 npm install
 npm run dev -- --port 3006
 ```
 
-然后打开：
+打开：
 
 ```text
 http://localhost:3006
 ```
 
-## 设置项说明
+### 配置项
 
-页面右上角可以配置：
+右上角设置面板支持配置：
 
 - API Key
 - API Base URL
-- API Key 传递方式
+- API 认证方式
 - 文本模型
 - 图片模型
 - 最大并发数
 - 单次图片请求超时
 - 额外请求头 JSON
 
-## 安全说明
+### 安全说明
 
-项目里没有写死你的真实 API Key。
+项目代码中没有硬编码你的真实 API Key。
 
-但前端代码支持从这些环境变量读取默认值：
+但前端支持从以下环境变量读取默认值：
 
 - `NEXT_PUBLIC_GEMINI_API_KEY`
 - `NEXT_PUBLIC_GEMINI_API_BASE_URL`
 - `NEXT_PUBLIC_GEMINI_TEXT_MODEL`
 - `NEXT_PUBLIC_GEMINI_IMAGE_MODEL`
 
-如果你要把项目发给别人使用，建议：
+如果你要公开发给别人使用，建议不要在部署环境里填真实 `NEXT_PUBLIC_GEMINI_API_KEY`。
 
-- 不要在部署环境里设置 `NEXT_PUBLIC_GEMINI_API_KEY`
-- 让用户自己在页面设置里填写自己的 key
+---
 
-## 调试说明
+## English
 
-开发模式下，服务端终端会输出详细日志，包括：
+### Core flow
 
-- 请求分类
-- 模型名称
-- 请求地址
-- 认证方式
-- 文本片段数 / 图片片段数
-- 上游状态码
-- 请求耗时
-- 是否返回图片
-- 上游错误信息
+1. a text model performs OCR and translation
+2. an image model redraws translated text inside the original layout
 
-## 目录结构
+### Features
 
-- `app/`
-  页面和 API 路由
-- `lib/`
-  网关配置和工具函数
-- `node_modules/`
-  依赖
+- batch image upload
+- OCR extraction for visible text
+- translated in-place redraw
+- single image download / ZIP export
+- relay-friendly Gemini-compatible setup
 
-## 已知情况
+### Recommended setup
 
-- 纯文本生图可用
-- OCR 文本识别可用
-- 原位翻译重绘可用
-- 去水印是否稳定，取决于当前中转站和图片模型组合
+- Text model: `gemini-3.1-flash-lite-preview`
+- Image model: `gemini-3.1-flash-image-preview`
+- Auth mode: `Bearer Token`
+
+### Recommended mode
+
+Use:
+
+- `Translate and redraw`
+
+### Run locally
+
+```bash
+npm install
+npm run dev -- --port 3006
+```
+
+Open:
+
+```text
+http://localhost:3006
+```
+
+### Security note
+
+The repository does not hardcode your real API key.
+However, the frontend can read default values from `NEXT_PUBLIC_*` variables, so do not ship a real public API key in those values when sharing the app.
+
