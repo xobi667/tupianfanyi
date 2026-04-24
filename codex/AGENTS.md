@@ -151,3 +151,19 @@ Every small change should append a new entry instead of overwriting history.
   - do not leave question marks, mojibake, or partial rewrites in user-facing docs or logs
   - when in doubt, rewrite the affected file deterministically instead of patching blindly
 
+## 2026-04-25
+
+### Entry 12
+
+- Trigger: the user asked to update all project Markdown after the UI/history/memory changes.
+- What changed:
+  - refreshed root README and project README
+  - added root `AGENTS.md`
+  - added `codex/CURRENT_STATE.md`
+  - updated `.impeccable.md` design context
+- Pitfall:
+  - `node_modules` contains many third-party Markdown files and must not be treated as project docs
+- Final fix:
+  - only project-owned Markdown files were updated
+  - documented current UI, history persistence, memory notes, safe cleanup targets, and encoding rules
+

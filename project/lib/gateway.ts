@@ -5,16 +5,23 @@ export type GatewayAuthMode =
   | 'query';
 
 export interface GatewaySettings {
-  apiKey: string;
   apiBaseUrl: string;
-  authMode: GatewayAuthMode;
-  customAuthHeader: string;
-  extraHeadersText: string;
+  requestHeadersText: string;
+  requestQueryParamsText: string;
   textModel: string;
   imageModel: string;
   maxParallelTasks: number;
   imageRequestTimeoutMs: number;
+  apiKey?: string;
+  authMode?: GatewayAuthMode;
+  customAuthHeader?: string;
+  extraHeadersText?: string;
 }
+
+export type ImageRequestTransport =
+  | 'openai-images'
+  | 'openai-chat-completions'
+  | 'generate-content';
 
 export type GatewayPart =
   | { text: string }
@@ -56,11 +63,11 @@ export interface GatewayGenerateResponse {
   };
 }
 
-export function parseExtraHeaders(extraHeadersText: string) {
-  const trimmed = extraHeadersText.trim();
+function parseJsonObjectText(value: string, label: string) {
+  const trimmed = value.trim();
 
   if (!trimmed) {
-    return {};
+    return {} as Record<string, string>;
   }
 
   let parsed: unknown;
@@ -68,74 +75,173 @@ export function parseExtraHeaders(extraHeadersText: string) {
   try {
     parsed = JSON.parse(trimmed);
   } catch {
-    throw new Error('额外请求头必须是合法的 JSON 对象。');
+    throw new Error(`${label} must be a valid JSON object.`);
   }
 
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error('额外请求头必须是 JSON 对象。');
+    throw new Error(`${label} must be a JSON object.`);
   }
 
   return Object.fromEntries(
-    Object.entries(parsed).map(([key, value]) => [key, String(value)]),
+    Object.entries(parsed).map(([key, itemValue]) => [key, String(itemValue)]),
   );
 }
 
-export function normalizeSettings(
-  settings: GatewaySettings,
-  options?: { requireApiKey?: boolean },
-) {
-  const apiKey = settings.apiKey.trim();
-  const apiBaseUrl = settings.apiBaseUrl.trim().replace(/\/+$/, '');
-  const customAuthHeader = settings.customAuthHeader.trim();
-  const textModel = settings.textModel.trim().replace(/^models\//, '');
-  const imageModel = settings.imageModel.trim().replace(/^models\//, '');
-  const extraHeadersText = settings.extraHeadersText.trim() || '{}';
-  const maxParallelTasks = Number(settings.maxParallelTasks);
-  const imageRequestTimeoutMs = Number(settings.imageRequestTimeoutMs);
+function stringifyJsonObject(value: Record<string, string>) {
+  return Object.keys(value).length === 0 ? '{}' : JSON.stringify(value, null, 2);
+}
 
-  if (options?.requireApiKey && !apiKey) {
-    throw new Error('请先在右上角设置里填写 API Key。');
+export function parseRequestHeadersText(requestHeadersText: string) {
+  return parseJsonObjectText(requestHeadersText, 'Request headers JSON');
+}
+
+export function parseRequestQueryParamsText(requestQueryParamsText: string) {
+  return parseJsonObjectText(requestQueryParamsText, 'URL params JSON');
+}
+
+export function normalizeModelName(model?: string) {
+  return typeof model === 'string' ? model.trim().replace(/^models\//, '') : '';
+}
+
+export function isGeminiModel(model?: string) {
+  return /^gemini-/i.test(normalizeModelName(model));
+}
+
+export function isGptImageModel(model?: string) {
+  return /^gpt-image-/i.test(normalizeModelName(model));
+}
+
+export function isOfficialGeminiBaseUrl(apiBaseUrl: string) {
+  try {
+    const parsed = new URL(apiBaseUrl.trim());
+    return /(^|\.)generativelanguage\.googleapis\.com$/i.test(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function buildLegacyRequestConfig(settings: Partial<GatewaySettings>) {
+  const headers = settings.extraHeadersText
+    ? parseJsonObjectText(settings.extraHeadersText, 'Legacy extra headers JSON')
+    : {};
+  const query = {} as Record<string, string>;
+  const apiKey = settings.apiKey?.trim() ?? '';
+  const authMode = settings.authMode;
+  const customAuthHeader = settings.customAuthHeader?.trim() ?? '';
+
+  if (!apiKey) {
+    return {
+      requestHeadersText: stringifyJsonObject(headers),
+      requestQueryParamsText: stringifyJsonObject(query),
+    };
   }
 
+  if (authMode === 'query') {
+    query[customAuthHeader || 'key'] = apiKey;
+  } else if (authMode === 'custom') {
+    headers[customAuthHeader || 'x-api-key'] = apiKey;
+  } else if (authMode === 'x-goog-api-key') {
+    headers['x-goog-api-key'] = apiKey;
+  } else if (authMode === 'bearer') {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
+
+  return {
+    requestHeadersText: stringifyJsonObject(headers),
+    requestQueryParamsText: stringifyJsonObject(query),
+  };
+}
+
+export function getPrimaryImageRequestTransport(
+  model: string,
+  settings: Pick<GatewaySettings, 'apiBaseUrl'>,
+): ImageRequestTransport {
+  if (isGptImageModel(model)) {
+    return 'openai-images';
+  }
+
+  if (isGeminiModel(model)) {
+    return 'generate-content';
+  }
+
+  return 'openai-chat-completions';
+}
+
+export function shouldUseOpenAiChatFallback(
+  model: string,
+  settings: Pick<GatewaySettings, 'apiBaseUrl'>,
+) {
+  return getPrimaryImageRequestTransport(model, settings) === 'openai-chat-completions';
+}
+
+export function normalizeSettings(
+  settings: Partial<GatewaySettings>,
+  _options?: { requireApiKey?: boolean },
+) {
+  const apiBaseUrl = (settings.apiBaseUrl ?? '').trim().replace(/\/+$/, '');
+  const textModel = (settings.textModel ?? '').trim().replace(/^models\//, '');
+  const imageModel = (settings.imageModel ?? '').trim().replace(/^models\//, '');
+  const maxParallelTasks = Number(settings.maxParallelTasks);
+  const imageRequestTimeoutMs = Number(settings.imageRequestTimeoutMs);
+  const legacyRequestConfig = buildLegacyRequestConfig(settings);
+  const rawRequestHeadersText = settings.requestHeadersText;
+  const rawRequestQueryParamsText = settings.requestQueryParamsText;
+  const hasExplicitRequestHeaders = typeof rawRequestHeadersText === 'string';
+  const hasExplicitRequestQueryParams = typeof rawRequestQueryParamsText === 'string';
+  const requestHeadersText = hasExplicitRequestHeaders
+    ? rawRequestHeadersText.trim() || '{}'
+    : legacyRequestConfig.requestHeadersText;
+  const requestQueryParamsText = hasExplicitRequestQueryParams
+    ? rawRequestQueryParamsText.trim() || '{}'
+    : legacyRequestConfig.requestQueryParamsText;
+
   if (!apiBaseUrl) {
-    throw new Error('API Base URL 不能为空。');
+    throw new Error('API Base URL cannot be empty.');
   }
 
   if (!/^https?:\/\//i.test(apiBaseUrl)) {
-    throw new Error('API Base URL 必须以 http:// 或 https:// 开头。');
+    throw new Error('API Base URL must start with http:// or https://.');
+  }
+
+  try {
+    const parsedBaseUrl = new URL(apiBaseUrl);
+
+    if (/(^|\.)apifox\.cn$/i.test(parsedBaseUrl.hostname)) {
+      throw new Error(
+        'API Base URL must be the real API host, not the Apifox docs URL. Use https://yunwu.ai/v1 instead of https://yunwu.apifox.cn.',
+      );
+    }
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new Error('API Base URL must be a valid URL.');
+    }
+
+    throw error;
   }
 
   if (!textModel) {
-    throw new Error('文本模型不能为空。');
+    throw new Error('Text model cannot be empty.');
   }
 
   if (!imageModel) {
-    throw new Error('生图模型不能为空。');
+    throw new Error('Image model cannot be empty.');
   }
 
   if (!Number.isFinite(maxParallelTasks) || maxParallelTasks < 1) {
-    throw new Error('并发任务数必须是大于等于 1 的数字。');
+    throw new Error('Max parallel tasks must be a number greater than or equal to 1.');
   }
 
   if (!Number.isFinite(imageRequestTimeoutMs) || imageRequestTimeoutMs < 1000) {
-    throw new Error('生图超时时间必须至少为 1000 毫秒。');
+    throw new Error('Image request timeout must be at least 1000 milliseconds.');
   }
 
-  if (
-    (settings.authMode === 'custom' || settings.authMode === 'query') &&
-    !customAuthHeader
-  ) {
-    throw new Error('选择自定义 Header 或 Query 参数时，必须填写字段名称。');
-  }
-
-  parseExtraHeaders(extraHeadersText);
+  const normalizedRequestHeaders = parseRequestHeadersText(requestHeadersText);
+  const normalizedRequestQueryParams = parseRequestQueryParamsText(requestQueryParamsText);
 
   return {
-    apiKey,
     apiBaseUrl,
-    authMode: settings.authMode,
-    customAuthHeader,
-    extraHeadersText,
+    requestHeadersText: stringifyJsonObject(normalizedRequestHeaders),
+    requestQueryParamsText: stringifyJsonObject(normalizedRequestQueryParams),
     textModel,
     imageModel,
     maxParallelTasks: Math.floor(maxParallelTasks),
@@ -146,12 +252,12 @@ export function normalizeSettings(
 export function buildGatewayUrl(
   apiBaseUrl: string,
   model: string,
-  settings?: Pick<GatewaySettings, 'authMode' | 'customAuthHeader' | 'apiKey'>,
+  settings?: Pick<GatewaySettings, 'requestQueryParamsText'>,
 ) {
   const cleanModel = model.trim().replace(/^models\//, '');
 
   if (!cleanModel) {
-    throw new Error('模型名称不能为空。');
+    throw new Error('Model name cannot be empty.');
   }
 
   const fullEndpoint =
@@ -163,33 +269,19 @@ export function buildGatewayUrl(
       : `${apiBaseUrl}/models/${encodeURIComponent(cleanModel)}:generateContent`;
   const url = new URL(resolvedUrl);
 
-  if (settings?.authMode === 'query') {
-    url.searchParams.set(settings.customAuthHeader, settings.apiKey);
+  if (settings?.requestQueryParamsText) {
+    const queryParams = parseRequestQueryParamsText(settings.requestQueryParamsText);
+    Object.entries(queryParams).forEach(([key, value]) => {
+      url.searchParams.set(key, value);
+    });
   }
 
   return url.toString();
 }
 
 export function buildGatewayHeaders(settings: GatewaySettings) {
-  const headers: Record<string, string> = {
+  return {
     'Content-Type': 'application/json',
-    ...parseExtraHeaders(settings.extraHeadersText),
-  };
-
-  if (settings.authMode === 'bearer') {
-    headers.Authorization = `Bearer ${settings.apiKey}`;
-    return headers;
-  }
-
-  if (settings.authMode === 'custom') {
-    headers[settings.customAuthHeader] = settings.apiKey;
-    return headers;
-  }
-
-  if (settings.authMode === 'query') {
-    return headers;
-  }
-
-  headers['x-goog-api-key'] = settings.apiKey;
-  return headers;
+    ...parseRequestHeadersText(settings.requestHeadersText),
+  } as Record<string, string>;
 }

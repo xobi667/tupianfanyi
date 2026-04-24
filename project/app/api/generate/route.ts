@@ -1,11 +1,20 @@
+import { lookup } from 'node:dns/promises';
+import { isIP } from 'node:net';
 import { NextResponse } from 'next/server';
 import {
   buildGatewayHeaders,
   buildGatewayUrl,
+  isGptImageModel,
+  parseRequestHeadersText,
+  parseRequestQueryParamsText,
   normalizeSettings,
+  shouldUseOpenAiChatFallback,
   type GatewayGenerateRequest,
   type GatewayGenerateResponse,
+  type GatewaySettings,
 } from '@/lib/gateway';
+
+export const runtime = 'nodejs';
 
 function errorResponse(message: string, status = 400) {
   return NextResponse.json(
@@ -35,12 +44,14 @@ function toChineseDebugLabel(label?: string) {
   return label;
 }
 
-function toChineseAuthMode(authMode: string) {
-  if (authMode === 'x-goog-api-key') return '官方请求头 x-goog-api-key';
-  if (authMode === 'bearer') return 'Authorization: Bearer';
-  if (authMode === 'custom') return '自定义请求头';
-  if (authMode === 'query') return 'URL 参数';
-  return authMode;
+function summarizeRequestConfig(settings: Pick<GatewaySettings, 'requestHeadersText' | 'requestQueryParamsText'>) {
+  const headerKeys = Object.keys(parseRequestHeadersText(settings.requestHeadersText));
+  const queryKeys = Object.keys(parseRequestQueryParamsText(settings.requestQueryParamsText));
+
+  return {
+    headerKeys,
+    queryKeys,
+  };
 }
 
 function toChineseContentsMode(contentsMode?: GatewayGenerateRequest['contentsMode']) {
@@ -84,34 +95,290 @@ function isImageRequest(body: Partial<GatewayGenerateRequest>) {
   return body.requestKind === 'image';
 }
 
+function shouldUseOpenAiImagesPath(body: Partial<GatewayGenerateRequest>) {
+  return isImageRequest(body) && isGptImageModel(body.model);
+}
+
 function shouldUseOpenAiImagePath(
   body: Partial<GatewayGenerateRequest>,
   settings: ReturnType<typeof normalizeSettings>,
 ) {
-  return isImageRequest(body) && settings.authMode === 'bearer';
+  return isImageRequest(body) && shouldUseOpenAiChatFallback(body.model ?? '', settings);
 }
 
-function buildOpenAiChatCompletionsUrl(apiBaseUrl: string) {
+function applyQueryAuth(
+  url: URL,
+  settings?: Pick<GatewaySettings, 'requestQueryParamsText'>,
+) {
+  if (!settings?.requestQueryParamsText) {
+    return;
+  }
+
+  const queryParams = parseRequestQueryParamsText(settings.requestQueryParamsText);
+  Object.entries(queryParams).forEach(([key, value]) => {
+    url.searchParams.set(key, value);
+  });
+}
+
+function buildOpenAiCompatibleUrl(
+  apiBaseUrl: string,
+  endpointPath: string,
+  settings?: Pick<GatewaySettings, 'requestQueryParamsText'>,
+) {
   const baseUrl = apiBaseUrl.trim().replace(/\/+$/, '');
-
-  if (/\/chat\/completions$/i.test(baseUrl)) {
-    return baseUrl;
-  }
-
   const url = new URL(baseUrl);
+  const cleanEndpointPath = endpointPath.replace(/^\/+/, '');
+  const versionMatch = url.pathname.match(/^(.*?)(\/v\d+(?:beta)?)(?:\/.*)?$/i);
 
-  if (/\/v\d+(beta)?$/i.test(url.pathname)) {
-    url.pathname = `${url.pathname}/chat/completions`;
-    return url.toString();
+  if (versionMatch) {
+    const prefix = versionMatch[1] ?? '';
+    const version = versionMatch[2] ?? '/v1';
+    url.pathname = `${prefix}${version}/${cleanEndpointPath}`.replace(/\/{2,}/g, '/');
+  } else if (
+    /\/(?:chat\/completions|images\/generations|images\/edits|responses|models(?:\/.*)?)$/i.test(
+      url.pathname,
+    )
+  ) {
+    url.pathname = url.pathname.replace(
+      /\/(?:chat\/completions|images\/generations|images\/edits|responses|models(?:\/.*)?)$/i,
+      `/v1/${cleanEndpointPath}`,
+    );
+  } else {
+    const prefix = url.pathname.replace(/\/+$/, '');
+    url.pathname = `${prefix || ''}/v1/${cleanEndpointPath}`.replace(/\/{2,}/g, '/');
   }
 
-  if (/\/v\d+(beta)?\/models(?:\/.*)?$/i.test(url.pathname)) {
-    url.pathname = url.pathname.replace(/\/models(?:\/.*)?$/i, '/chat/completions');
-    return url.toString();
-  }
-
-  url.pathname = `${url.pathname.replace(/\/+$/, '')}/chat/completions`;
+  applyQueryAuth(url, settings);
   return url.toString();
+}
+
+function buildOpenAiChatCompletionsUrl(
+  apiBaseUrl: string,
+  settings?: Pick<GatewaySettings, 'requestQueryParamsText'>,
+) {
+  return buildOpenAiCompatibleUrl(apiBaseUrl, 'chat/completions', settings);
+}
+
+function buildOpenAiImagesUrl(
+  apiBaseUrl: string,
+  endpoint: 'generations' | 'edits',
+  settings?: Pick<GatewaySettings, 'requestQueryParamsText'>,
+) {
+  return buildOpenAiCompatibleUrl(apiBaseUrl, `images/${endpoint}`, settings);
+}
+
+function getTextPromptFromParts(parts: GatewayGenerateRequest['parts'] = []) {
+  return parts
+    .flatMap((part) => ('text' in part ? [part.text.trim()] : []))
+    .filter(Boolean)
+    .join('\n\n')
+    .trim();
+}
+
+function getImageParts(parts: GatewayGenerateRequest['parts'] = []) {
+  return parts.flatMap((part) => ('inlineData' in part ? [part.inlineData] : []));
+}
+
+function detectKnownImageMimeTypeFromBase64(base64Data: string) {
+  try {
+    const bytes = Buffer.from(base64Data, 'base64');
+
+    if (
+      bytes.length >= 8 &&
+      bytes[0] === 0x89 &&
+      bytes[1] === 0x50 &&
+      bytes[2] === 0x4e &&
+      bytes[3] === 0x47
+    ) {
+      return 'image/png';
+    }
+
+    if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+      return 'image/jpeg';
+    }
+
+    if (
+      bytes.length >= 12 &&
+      bytes[0] === 0x52 &&
+      bytes[1] === 0x49 &&
+      bytes[2] === 0x46 &&
+      bytes[3] === 0x46 &&
+      bytes[8] === 0x57 &&
+      bytes[9] === 0x45 &&
+      bytes[10] === 0x42 &&
+      bytes[11] === 0x50
+    ) {
+      return 'image/webp';
+    }
+
+    if (
+      bytes.length >= 6 &&
+      bytes[0] === 0x47 &&
+      bytes[1] === 0x49 &&
+      bytes[2] === 0x46 &&
+      bytes[3] === 0x38
+    ) {
+      return 'image/gif';
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function detectImageMimeTypeFromBase64(base64Data: string) {
+  return detectKnownImageMimeTypeFromBase64(base64Data) ?? 'image/png';
+}
+
+function getExtensionForMimeType(mimeType: string) {
+  if (mimeType === 'image/jpeg') return 'jpg';
+  if (mimeType === 'image/webp') return 'webp';
+  if (mimeType === 'image/gif') return 'gif';
+  return 'png';
+}
+
+function buildGatewayImageResponse(
+  data: string,
+  mimeType: string,
+  finishReason = 'STOP',
+  error?: { message?: string },
+) {
+  return {
+    candidates: [
+      {
+        finishReason,
+        content: {
+          parts: [
+            {
+              inlineData: {
+                mimeType,
+                data,
+              },
+            },
+          ],
+        },
+      },
+    ],
+    error,
+  } satisfies GatewayGenerateResponse;
+}
+
+function buildGatewayTextResponse(
+  text: string,
+  finishReason = 'STOP',
+  error?: { message?: string },
+) {
+  return {
+    candidates: [
+      {
+        finishReason,
+        content: {
+          parts: [
+            {
+              text,
+            },
+          ],
+        },
+      },
+    ],
+    error,
+  } satisfies GatewayGenerateResponse;
+}
+
+function extractTextFromOpenAiContent(content: unknown): string {
+  if (typeof content === 'string') {
+    const trimmed = content.trim();
+
+    if (!trimmed || trimmed.startsWith('data:image/') || /^https?:\/\//i.test(trimmed)) {
+      return '';
+    }
+
+    return trimmed;
+  }
+
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => extractTextFromOpenAiContent(item))
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+  }
+
+  if (!content || typeof content !== 'object') {
+    return '';
+  }
+
+  const record = content as Record<string, unknown>;
+  const directText = record.text;
+
+  if (typeof directText === 'string' && directText.trim()) {
+    return directText.trim();
+  }
+
+  return [record.content, record.output_text, record.message]
+    .map((item) => extractTextFromOpenAiContent(item))
+    .find(Boolean) ?? '';
+}
+
+function extractDataUriFromOpenAiContent(content: unknown): string {
+  if (Array.isArray(content)) {
+    return content.map((item) => extractDataUriFromOpenAiContent(item)).find(Boolean) ?? '';
+  }
+
+  if (content && typeof content === 'object') {
+    const record = content as Record<string, unknown>;
+
+    if (typeof record.b64_json === 'string' && record.b64_json.trim()) {
+      const mimeType = detectImageMimeTypeFromBase64(record.b64_json);
+      return `data:${mimeType};base64,${record.b64_json}`;
+    }
+
+    return [
+      record.url,
+      record.data,
+      record.image,
+      record.image_base64,
+      record.result,
+      record.content,
+      record.message,
+      record.image_url,
+    ]
+      .map((item) => extractDataUriFromOpenAiContent(item))
+      .find(Boolean) ?? '';
+  }
+
+  if (typeof content !== 'string' || !content.trim()) {
+    return '';
+  }
+
+  const trimmed = content.trim();
+  const markdownMatch = trimmed.match(/!\[[\s\S]*?\]\((data:image\/[^)]+)\)/i);
+
+  if (markdownMatch?.[1]) {
+    return markdownMatch[1];
+  }
+
+  if (trimmed.startsWith('data:image/')) {
+    return trimmed;
+  }
+
+  const embeddedDataUriMatch = trimmed.match(/(data:image\/[a-zA-Z0-9.+-]+;base64,[a-zA-Z0-9+/=\s]+)/i);
+
+  if (embeddedDataUriMatch?.[1]) {
+    return embeddedDataUriMatch[1].trim();
+  }
+
+  const cleaned = trimmed
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/\s*```$/i, '');
+
+  try {
+    return extractDataUriFromOpenAiContent(JSON.parse(cleaned));
+  } catch {
+    return '';
+  }
 }
 
 function buildOpenAiImagePayload(body: Partial<GatewayGenerateRequest>) {
@@ -144,145 +411,312 @@ function buildOpenAiImagePayload(body: Partial<GatewayGenerateRequest>) {
   };
 }
 
-function extractDataUriFromOpenAiContent(content: unknown) {
+function extractImageUrlFromOpenAiContent(content: unknown): string {
+  if (Array.isArray(content)) {
+    return content.map((item) => extractImageUrlFromOpenAiContent(item)).find(Boolean) ?? '';
+  }
+
+  if (content && typeof content === 'object') {
+    const record = content as Record<string, unknown>;
+
+    return [
+      record.url,
+      record.image_url,
+      record.data,
+      record.result,
+      record.content,
+      record.message,
+    ]
+      .map((item) => extractImageUrlFromOpenAiContent(item))
+      .find(Boolean) ?? '';
+  }
+
   if (typeof content !== 'string' || !content.trim()) {
     return '';
   }
 
-  const markdownMatch = content.match(/!\[[\s\S]*?\]\((data:image\/[^)]+)\)/i);
+  const trimmed = content.trim();
+  const markdownMatch = trimmed.match(/!\[[\s\S]*?\]\((https?:\/\/[^)]+)\)/i);
   if (markdownMatch?.[1]) {
     return markdownMatch[1];
   }
 
-  if (content.startsWith('data:image/')) {
-    return content;
+  if (/^https?:\/\//i.test(trimmed)) {
+    return trimmed;
   }
 
-  const cleaned = content
+  const cleaned = trimmed
     .trim()
     .replace(/^```json\s*/i, '')
     .replace(/^```\s*/i, '')
     .replace(/\s*```$/i, '');
 
   try {
-    const parsed = JSON.parse(cleaned) as {
-      image_base64?: unknown;
-      image?: unknown;
-      data?: unknown;
-      result?: {
-        image_base64?: unknown;
-        image?: unknown;
-        data?: unknown;
-      };
-    };
-
-    const possibleValues = [
-      parsed.image_base64,
-      parsed.image,
-      parsed.data,
-      parsed.result?.image_base64,
-      parsed.result?.image,
-      parsed.result?.data,
-    ];
-
-    const match = possibleValues.find(
-      (value): value is string =>
-        typeof value === 'string' && value.startsWith('data:image/'),
-    );
-
-    return match ?? '';
+    return extractImageUrlFromOpenAiContent(JSON.parse(cleaned));
   } catch {
     return '';
   }
 }
 
-function normalizeOpenAiChatResponse(rawText: string) {
+function buildOpenAiImagesPayload(body: Partial<GatewayGenerateRequest>) {
+  const prompt = getTextPromptFromParts(body.parts);
+  const imageParts = getImageParts(body.parts);
+
+  if (!prompt) {
+    throw new Error('Image requests require a text prompt.');
+  }
+
+  if (imageParts.length === 0) {
+    return {
+      endpoint: 'generations' as const,
+      body: JSON.stringify({
+        model: body.model?.trim(),
+        prompt,
+        n: 1,
+        size: 'auto',
+      }),
+    };
+  }
+
+  const formData = new FormData();
+
+  imageParts.forEach((part, index) => {
+    const bytes = Buffer.from(part.data, 'base64');
+    const fileName = `image-${index + 1}.${getExtensionForMimeType(part.mimeType)}`;
+    formData.append('image', new Blob([bytes], { type: part.mimeType }), fileName);
+  });
+  formData.append('model', body.model?.trim() ?? '');
+  formData.append('prompt', prompt);
+  formData.append('n', '1');
+  formData.append('size', 'auto');
+
+  return {
+    endpoint: 'edits' as const,
+    body: formData,
+  };
+}
+
+function isUnsafeIpAddress(address: string) {
+  const normalizedAddress = address.trim().toLowerCase().split('%')[0];
+  const family = isIP(normalizedAddress);
+
+  if (family === 4) {
+    const segments = normalizedAddress.split('.').map((segment) => Number(segment));
+
+    if (segments.length !== 4 || segments.some((segment) => !Number.isInteger(segment))) {
+      return true;
+    }
+
+    const [first, second] = segments;
+    return (
+      first === 0 ||
+      first === 10 ||
+      first === 127 ||
+      (first === 169 && second === 254) ||
+      (first === 172 && second >= 16 && second <= 31) ||
+      (first === 192 && second === 168) ||
+      (first === 100 && second >= 64 && second <= 127)
+    );
+  }
+
+  if (family === 6) {
+    return (
+      normalizedAddress === '::' ||
+      normalizedAddress === '::1' ||
+      normalizedAddress.startsWith('fc') ||
+      normalizedAddress.startsWith('fd') ||
+      normalizedAddress.startsWith('fe80:')
+    );
+  }
+
+  return false;
+}
+
+function isUnsafeHostname(hostname: string) {
+  const normalizedHostname = hostname.trim().toLowerCase();
+
+  return (
+    normalizedHostname === 'localhost' ||
+    normalizedHostname.endsWith('.localhost') ||
+    normalizedHostname === 'local'
+  );
+}
+
+async function validateRemoteImageUrl(imageUrl: string) {
+  let parsedUrl: URL;
+
+  try {
+    parsedUrl = new URL(imageUrl);
+  } catch {
+    throw new Error('远程图片 URL 格式无效。');
+  }
+
+  if (parsedUrl.protocol !== 'https:') {
+    throw new Error('远程图片 URL 仅支持 https。');
+  }
+
+  if (parsedUrl.username || parsedUrl.password) {
+    throw new Error('远程图片 URL 不能包含账号信息。');
+  }
+
+  if (isUnsafeHostname(parsedUrl.hostname) || isUnsafeIpAddress(parsedUrl.hostname)) {
+    throw new Error('远程图片 URL 不能指向本地或私网地址。');
+  }
+
+  const dnsResults = await lookup(parsedUrl.hostname, {
+    all: true,
+    verbatim: true,
+  });
+
+  if (dnsResults.length === 0) {
+    throw new Error('远程图片 URL 域名解析失败。');
+  }
+
+  if (dnsResults.some((result) => isUnsafeIpAddress(result.address))) {
+    throw new Error('远程图片 URL 不能解析到本地或私网地址。');
+  }
+
+  return parsedUrl.toString();
+}
+
+async function fetchImageUrlAsGatewayResponse(
+  imageUrl: string,
+  signal?: AbortSignal,
+  finishReason = 'STOP',
+  error?: { message?: string },
+) {
+  const safeImageUrl = await validateRemoteImageUrl(imageUrl);
+  const imageResponse = await fetch(safeImageUrl, {
+    headers: {
+      Accept: 'image/*',
+    },
+    redirect: 'error',
+    signal,
+  });
+
+  if (!imageResponse.ok) {
+    throw new Error(`远程图片 URL 抓取失败 (${imageResponse.status}).`);
+  }
+
+  const arrayBuffer = await imageResponse.arrayBuffer();
+  const base64Data = Buffer.from(arrayBuffer).toString('base64');
+  const contentType = imageResponse.headers.get('content-type')?.split(';')[0]?.trim();
+  const sniffedMimeType = detectKnownImageMimeTypeFromBase64(base64Data);
+
+  if (contentType && !contentType.startsWith('image/')) {
+    throw new Error(`远程图片 URL 返回的 content-type 不是图片: ${contentType}`);
+  }
+
+  const mimeType = contentType && contentType.startsWith('image/')
+    ? contentType
+    : sniffedMimeType;
+
+  if (!mimeType) {
+    throw new Error('远程图片 URL 返回的内容不是有效的图片。');
+  }
+
+  return buildGatewayImageResponse(base64Data, mimeType, finishReason, error);
+}
+
+type OpenAiCompatibleResponsePayload = {
+  data?: Array<{
+    b64_json?: string;
+    url?: string;
+  }>;
+  choices?: Array<{
+    finish_reason?: string;
+    message?: {
+      content?: unknown;
+    };
+  }>;
+  error?: {
+    message?: string;
+  };
+};
+
+async function normalizeOpenAiCompatibleResponse(rawText: string, signal?: AbortSignal) {
   if (!rawText) {
     return null;
   }
 
+  const trimmed = rawText.trim();
+
+  if (trimmed.startsWith('data:image/')) {
+    const match = trimmed.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,([\s\S]+)$/);
+
+    if (match) {
+      return buildGatewayImageResponse(match[2], match[1]);
+    }
+  }
+
+  let parsed: OpenAiCompatibleResponsePayload;
+
   try {
-    const parsed = JSON.parse(rawText) as {
-      choices?: Array<{
-        finish_reason?: string;
-        message?: {
-          content?: unknown;
-        };
-      }>;
-      error?: {
-        message?: string;
-      };
-    };
-
-    const choice = parsed.choices?.[0];
-    const content = choice?.message?.content;
-    const dataUri = extractDataUriFromOpenAiContent(content);
-
-    if (dataUri) {
-      const match = dataUri.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,([\s\S]+)$/);
-
-      if (match) {
-        return {
-          candidates: [
-            {
-              finishReason: choice?.finish_reason?.toUpperCase() ?? 'STOP',
-              content: {
-                parts: [
-                  {
-                    inlineData: {
-                      mimeType: match[1],
-                      data: match[2],
-                    },
-                  },
-                ],
-              },
-            },
-          ],
-        } satisfies GatewayGenerateResponse;
-      }
-    }
-
-    if (typeof content === 'string') {
-      return {
-        candidates: [
-          {
-            finishReason: choice?.finish_reason?.toUpperCase() ?? 'STOP',
-            content: {
-              parts: [
-                {
-                  text: content,
-                },
-              ],
-            },
-          },
-        ],
-        error: parsed.error,
-      } satisfies GatewayGenerateResponse;
-    }
-
-    return parsed.error ? ({ error: parsed.error } satisfies GatewayGenerateResponse) : null;
+    parsed = JSON.parse(rawText) as OpenAiCompatibleResponsePayload;
   } catch {
     return null;
   }
+
+  const imageObject = parsed.data?.find(
+    (item) =>
+      typeof item?.b64_json === 'string' ||
+      typeof item?.url === 'string',
+  );
+
+  if (imageObject?.b64_json) {
+    const mimeType = detectImageMimeTypeFromBase64(imageObject.b64_json);
+    return buildGatewayImageResponse(imageObject.b64_json, mimeType, 'STOP', parsed.error);
+  }
+
+  if (imageObject?.url) {
+    return fetchImageUrlAsGatewayResponse(imageObject.url, signal, 'STOP', parsed.error);
+  }
+
+  const choice = parsed.choices?.[0];
+  const content = choice?.message?.content;
+  const dataUri = extractDataUriFromOpenAiContent(content);
+  const finishReason = choice?.finish_reason?.toUpperCase() ?? 'STOP';
+
+  if (dataUri) {
+    const match = dataUri.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,([\s\S]+)$/);
+
+    if (match) {
+      return buildGatewayImageResponse(match[2], match[1], finishReason, parsed.error);
+    }
+  }
+
+  const imageUrl = extractImageUrlFromOpenAiContent(content);
+
+  if (imageUrl) {
+    return fetchImageUrlAsGatewayResponse(imageUrl, signal, finishReason, parsed.error);
+  }
+
+  const text = extractTextFromOpenAiContent(content);
+
+  if (text) {
+    return buildGatewayTextResponse(text, finishReason, parsed.error);
+  }
+
+  return parsed.error ? ({ error: parsed.error } satisfies GatewayGenerateResponse) : null;
 }
 
 function shouldFallbackFromOpenAiImagePath(status: number, rawText: string) {
   return status === 404 || /Invalid URL/i.test(rawText);
 }
 
+function shouldFallbackFromOpenAiImagesPath(status: number, rawText: string) {
+  return (
+    status === 404 ||
+    status === 405 ||
+    status === 415 ||
+    /Invalid URL|Not Found|unsupported media type/i.test(rawText)
+  );
+}
+
 function buildUrlCandidates(targetUrl: URL) {
-  const urls = [targetUrl.toString()];
-
-  if (targetUrl.pathname.includes('/models/')) {
-    const fallbackUrl = new URL(targetUrl.toString());
-    fallbackUrl.pathname = fallbackUrl.pathname.replace('/models/', '/');
-
-    if (fallbackUrl.toString() !== targetUrl.toString()) {
-      urls.push(fallbackUrl.toString());
-    }
-  }
-
-  return urls;
+  // Third-party Gemini-compatible gateways such as yunwu.ai expect
+  // /v1/models/{model}:generateContent. Do not try /v1/{model}:generateContent.
+  return [targetUrl.toString()];
 }
 
 function tryParseGatewayResponse(rawText: string) {
@@ -323,6 +757,124 @@ function summarizeGatewayResponse(parsed: GatewayGenerateResponse | null) {
   };
 }
 
+function extractUpstreamErrorMessage(rawText: string) {
+  if (!rawText.trim()) {
+    return '';
+  }
+
+  try {
+    const parsed = JSON.parse(rawText) as Record<string, unknown>;
+    const error = parsed.error;
+
+    if (typeof error === 'string' && error.trim()) {
+      return error.trim();
+    }
+
+    if (error && typeof error === 'object') {
+      const errorRecord = error as Record<string, unknown>;
+      const errorMessage = errorRecord.message ?? errorRecord.detail ?? errorRecord.msg;
+
+      if (typeof errorMessage === 'string' && errorMessage.trim()) {
+        return errorMessage.trim();
+      }
+    }
+
+    const directMessage = parsed.message ?? parsed.detail ?? parsed.msg;
+
+    if (typeof directMessage === 'string' && directMessage.trim()) {
+      return directMessage.trim();
+    }
+  } catch {
+    return rawText.trim();
+  }
+
+  return rawText.trim();
+}
+
+function buildDebugHeaders(requestId: string, retryAfter?: string | null) {
+  const headers: Record<string, string> = {
+    'X-Debug-Request-Id': requestId,
+  };
+
+  if (retryAfter) {
+    headers['Retry-After'] = retryAfter;
+  }
+
+  return headers;
+}
+
+function buildUpstreamErrorMessage(status: number, rawText: string) {
+  const upstreamMessage = extractUpstreamErrorMessage(rawText);
+
+  if (status === 429) {
+    return upstreamMessage || '上游返回 429，当前通道限流，请稍后重试。';
+  }
+
+  if (status === 404 || status === 405 || status === 415) {
+    return upstreamMessage || `当前兼容路径不可用 (${status})。`;
+  }
+
+  if (status >= 500) {
+    return upstreamMessage || `上游服务暂时不可用 (${status})，请稍后重试。`;
+  }
+
+  return upstreamMessage || `上游请求失败 (${status})。`;
+}
+
+function buildUpstreamErrorResponse(
+  requestId: string,
+  upstreamResponse: Response,
+  rawText: string,
+) {
+  return NextResponse.json(
+    {
+      error: {
+        message: buildUpstreamErrorMessage(upstreamResponse.status, rawText),
+      },
+    },
+    {
+      status: upstreamResponse.status,
+      headers: buildDebugHeaders(
+        requestId,
+        upstreamResponse.headers.get('retry-after'),
+      ),
+    },
+  );
+}
+
+function buildInvalidUpstreamResponse(
+  requestId: string,
+  message: string,
+  rawText = '',
+) {
+  const upstreamMessage = extractUpstreamErrorMessage(rawText);
+  const finalMessage =
+    upstreamMessage && upstreamMessage !== rawText.trim()
+      ? upstreamMessage
+      : message;
+
+  return NextResponse.json(
+    {
+      error: {
+        message: finalMessage,
+      },
+    },
+    {
+      status: 502,
+      headers: buildDebugHeaders(requestId),
+    },
+  );
+}
+
+function shouldFallbackFromGenerateContentPath(status: number, rawText: string) {
+  return (
+    status === 404 ||
+    status === 405 ||
+    status === 415 ||
+    /Invalid URL|Not Found|unsupported media type/i.test(rawText)
+  );
+}
+
 function isAbortLikeError(error: unknown) {
   if (!(error instanceof Error)) {
     return false;
@@ -332,6 +884,15 @@ function isAbortLikeError(error: unknown) {
     error.name === 'AbortError' ||
     error.name === 'ResponseAborted' ||
     error.message.includes('ResponseAborted')
+  );
+}
+
+function isNetworkLikeError(error: unknown) {
+  return (
+    error instanceof Error &&
+    /fetch failed|network|socket hang up|connection reset|econnreset|ecanceled/i.test(
+      error.message,
+    )
   );
 }
 
@@ -359,13 +920,12 @@ export async function POST(request: Request) {
       return errorResponse('缺少请求内容。');
     }
 
-    const settings = normalizeSettings(body.settings, {
-      requireApiKey: true,
-    });
+    const settings = normalizeSettings(body.settings);
     const logPrefix = createLogPrefix(requestId);
     const startedAt = Date.now();
     const targetUrl = buildGatewayUrl(settings.apiBaseUrl, body.model, settings);
     const target = new URL(targetUrl);
+    const requestConfigSummary = summarizeRequestConfig(settings);
     const requestPayload = {
       contents:
         body.contentsMode === 'object_parts'
@@ -388,18 +948,94 @@ export async function POST(request: Request) {
     console.log(`${logPrefix} 请求分类: ${toChineseDebugLabel(body.debugLabel)}`);
     console.log(`${logPrefix} 模型名称: ${body.model.trim()}`);
     console.log(`${logPrefix} 请求地址: ${target.origin}${target.pathname}`);
-    console.log(`${logPrefix} Key 传递方式: ${toChineseAuthMode(settings.authMode)}`);
+    console.log(
+      `${logPrefix} 请求头键: ${requestConfigSummary.headerKeys.join(', ') || '无'}；URL 参数键: ${requestConfigSummary.queryKeys.join(', ') || '无'}`,
+    );
     console.log(`${logPrefix} 内容格式: ${toChineseContentsMode(body.contentsMode)}`);
     console.log(
       `${logPrefix} 文本片段数: ${partSummary.textParts}，图片片段数: ${partSummary.imageParts}`,
     );
 
+    if (shouldUseOpenAiImagesPath(body)) {
+      const imagesPayload = buildOpenAiImagesPayload(body);
+      const imagesUrl = buildOpenAiImagesUrl(
+        settings.apiBaseUrl,
+        imagesPayload.endpoint,
+        settings,
+      );
+      const imagesTarget = new URL(imagesUrl);
+      const imagesHeaders = buildGatewayHeaders(settings);
+
+      if (imagesPayload.body instanceof FormData) {
+        delete imagesHeaders['Content-Type'];
+      }
+
+      console.log(
+        `${logPrefix} Trying OpenAI Images compatible endpoint: ${imagesTarget.origin}${imagesTarget.pathname}`,
+      );
+
+      const upstreamResponse = await fetch(imagesUrl, {
+        method: 'POST',
+        headers: imagesHeaders,
+        body: imagesPayload.body,
+        signal: request.signal,
+      });
+
+      const rawText = await upstreamResponse.text();
+      let normalized: GatewayGenerateResponse | null = null;
+
+      try {
+        normalized = await normalizeOpenAiCompatibleResponse(rawText, request.signal);
+      } catch (error) {
+        return buildInvalidUpstreamResponse(
+          requestId,
+          error instanceof Error ? error.message : '上游返回了无法解析的图片响应。',
+          rawText,
+        );
+      }
+
+      const responseSummary = summarizeGatewayResponse(normalized);
+      const durationMs = Date.now() - startedAt;
+
+      console.log(`${logPrefix} OpenAI Images request completed`);
+      console.log(`${logPrefix} Upstream status: ${upstreamResponse.status}`);
+      console.log(`${logPrefix} Request duration: ${durationMs}ms`);
+      console.log(`${logPrefix} Finish reason: ${toChineseFinishReasons(responseSummary.finishReasons)}`);
+      console.log(`${logPrefix} Returned image: ${responseSummary.hasImage ? 'yes' : 'no'}`);
+      if (responseSummary.errorMessage) {
+        console.log(`${logPrefix} Upstream error: ${responseSummary.errorMessage}`);
+      }
+
+      if (upstreamResponse.ok && normalized && responseSummary.hasImage) {
+        return NextResponse.json(normalized, {
+          status: 200,
+          headers: {
+            'X-Debug-Request-Id': requestId,
+          },
+        });
+      }
+
+      if (upstreamResponse.ok) {
+        return buildInvalidUpstreamResponse(
+          requestId,
+          'OpenAI Images 接口返回了无法解析的图片响应。',
+          rawText,
+        );
+      }
+
+      if (!shouldFallbackFromOpenAiImagesPath(upstreamResponse.status, rawText)) {
+        return buildUpstreamErrorResponse(requestId, upstreamResponse, rawText);
+      }
+
+      console.log(`${logPrefix} OpenAI Images endpoint unavailable, falling back to chat/completions`);
+    }
+
     if (shouldUseOpenAiImagePath(body, settings)) {
-      const openAiUrl = buildOpenAiChatCompletionsUrl(settings.apiBaseUrl);
+      const openAiUrl = buildOpenAiChatCompletionsUrl(settings.apiBaseUrl, settings);
       const openAiTarget = new URL(openAiUrl);
 
       console.log(
-        `${logPrefix} 正在尝试 OpenAI 兼容图片编辑地址: ${openAiTarget.origin}${openAiTarget.pathname}`,
+        `${logPrefix} Trying OpenAI chat/completions image endpoint: ${openAiTarget.origin}${openAiTarget.pathname}`,
       );
 
       const upstreamResponse = await fetch(openAiUrl, {
@@ -410,20 +1046,31 @@ export async function POST(request: Request) {
       });
 
       const rawText = await upstreamResponse.text();
-      const normalized = normalizeOpenAiChatResponse(rawText);
+      let normalized: GatewayGenerateResponse | null = null;
+
+      try {
+        normalized = await normalizeOpenAiCompatibleResponse(rawText, request.signal);
+      } catch (error) {
+        return buildInvalidUpstreamResponse(
+          requestId,
+          error instanceof Error ? error.message : '上游返回了无法解析的图片响应。',
+          rawText,
+        );
+      }
+
       const responseSummary = summarizeGatewayResponse(normalized);
       const durationMs = Date.now() - startedAt;
 
-      console.log(`${logPrefix} OpenAI 兼容图片编辑请求完成`);
-      console.log(`${logPrefix} 上游状态码: ${upstreamResponse.status}`);
-      console.log(`${logPrefix} 请求耗时: ${durationMs}ms`);
-      console.log(`${logPrefix} 结束原因: ${toChineseFinishReasons(responseSummary.finishReasons)}`);
-      console.log(`${logPrefix} 是否返回图片: ${responseSummary.hasImage ? '是' : '否'}`);
+      console.log(`${logPrefix} OpenAI chat/completions request completed`);
+      console.log(`${logPrefix} Upstream status: ${upstreamResponse.status}`);
+      console.log(`${logPrefix} Request duration: ${durationMs}ms`);
+      console.log(`${logPrefix} Finish reason: ${toChineseFinishReasons(responseSummary.finishReasons)}`);
+      console.log(`${logPrefix} Returned image: ${responseSummary.hasImage ? 'yes' : 'no'}`);
       if (responseSummary.errorMessage) {
-        console.log(`${logPrefix} 上游错误信息: ${responseSummary.errorMessage}`);
+        console.log(`${logPrefix} Upstream error: ${responseSummary.errorMessage}`);
       }
 
-      if (upstreamResponse.ok && normalized) {
+      if (upstreamResponse.ok && normalized && responseSummary.hasImage) {
         return NextResponse.json(normalized, {
           status: 200,
           headers: {
@@ -432,22 +1079,24 @@ export async function POST(request: Request) {
         });
       }
 
-      if (!shouldFallbackFromOpenAiImagePath(upstreamResponse.status, rawText)) {
-        return new Response(rawText, {
-          status: upstreamResponse.status,
-          headers: {
-            'Content-Type': upstreamResponse.headers.get('content-type') ?? 'application/json',
-            'X-Debug-Request-Id': requestId,
-          },
-        });
+      if (upstreamResponse.ok) {
+        return buildInvalidUpstreamResponse(
+          requestId,
+          'OpenAI 兼容接口返回了无法解析的图片响应。',
+          rawText,
+        );
       }
 
-      console.log(`${logPrefix} OpenAI 兼容地址不可用，回退到 generateContent`);
+      if (!shouldFallbackFromOpenAiImagePath(upstreamResponse.status, rawText)) {
+        return buildUpstreamErrorResponse(requestId, upstreamResponse, rawText);
+      }
+
+      console.log(`${logPrefix} OpenAI chat/completions unavailable, falling back to generateContent`);
     }
 
     const urlCandidates = buildUrlCandidates(target);
-    let lastResponse: Response | null = null;
     let lastRawText = '';
+    let lastInvalidMessage = '';
 
     for (const [index, candidateUrl] of urlCandidates.entries()) {
       const currentUrl = new URL(candidateUrl);
@@ -480,13 +1129,16 @@ export async function POST(request: Request) {
       }
 
       if (!upstreamResponse.ok) {
-        return new Response(rawText, {
-          status: upstreamResponse.status,
-          headers: {
-            'Content-Type': contentType,
-            'X-Debug-Request-Id': requestId,
-          },
-        });
+        if (
+          index < urlCandidates.length - 1 &&
+          shouldFallbackFromGenerateContentPath(upstreamResponse.status, rawText)
+        ) {
+          lastRawText = rawText;
+          console.log(`${logPrefix} generateContent 地址不兼容，继续尝试下一个候选地址`);
+          continue;
+        }
+
+        return buildUpstreamErrorResponse(requestId, upstreamResponse, rawText);
       }
 
       if (!isImageRequest(body)) {
@@ -494,7 +1146,10 @@ export async function POST(request: Request) {
           status: upstreamResponse.status,
           headers: {
             'Content-Type': contentType,
-            'X-Debug-Request-Id': requestId,
+            ...buildDebugHeaders(
+              requestId,
+              upstreamResponse.headers.get('retry-after'),
+            ),
           },
         });
       }
@@ -504,40 +1159,64 @@ export async function POST(request: Request) {
           status: upstreamResponse.status,
           headers: {
             'Content-Type': contentType,
-            'X-Debug-Request-Id': requestId,
+            ...buildDebugHeaders(
+              requestId,
+              upstreamResponse.headers.get('retry-after'),
+            ),
           },
         });
       }
 
-      lastResponse = upstreamResponse;
       lastRawText = rawText;
+      lastInvalidMessage = parsed?.error?.message ?? '上游返回了无法解析的图片响应。';
     }
 
-    return new Response(lastRawText, {
-      status: lastResponse?.status ?? 500,
-      headers: {
-        'Content-Type': lastResponse?.headers.get('content-type') ?? 'application/json',
-        'X-Debug-Request-Id': requestId,
-      },
-    });
+    return buildInvalidUpstreamResponse(
+      requestId,
+      lastInvalidMessage || '上游返回了无法解析的图片响应。',
+      lastRawText,
+    );
   } catch (error) {
     if (isAbortLikeError(error)) {
       console.log(`${createLogPrefix(requestId)} 请求已被前端取消或超时`);
       return new Response(null, {
         status: 499,
-        headers: {
-          'X-Debug-Request-Id': requestId,
-        },
+        headers: buildDebugHeaders(requestId),
       });
+    }
+
+    if (isNetworkLikeError(error)) {
+      console.error(`${createLogPrefix(requestId)} 上游网络异常`);
+      console.error(
+        `${createLogPrefix(requestId)} ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return NextResponse.json(
+        {
+          error: {
+            message: '上游连接失败，请稍后重试。',
+          },
+        },
+        {
+          status: 502,
+          headers: buildDebugHeaders(requestId),
+        },
+      );
     }
 
     console.error(`${createLogPrefix(requestId)} 请求异常`);
     console.error(
       `${createLogPrefix(requestId)} ${error instanceof Error ? error.message : String(error)}`,
     );
-    return errorResponse(
-      error instanceof Error ? error.message : '服务端请求失败。',
-      500,
+    return NextResponse.json(
+      {
+        error: {
+          message: error instanceof Error ? error.message : '服务端请求失败。',
+        },
+      },
+      {
+        status: 500,
+        headers: buildDebugHeaders(requestId),
+      },
     );
   }
 }

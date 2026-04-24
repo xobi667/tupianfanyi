@@ -1,112 +1,68 @@
 # 图片翻译器 / Image Translator
 
-一个面向电商场景的图片翻译与原位重绘工具。  
-A Next.js tool for translating in-image text and redrawing it in place for product posters, detail images, and localized creatives.
+面向电商图、海报图、产品图的本地图片翻译工作台。上传图片后，原图会落盘到本地 `资源/`，翻译结果和历史记录也会持续保存，刷新浏览器后可以从历史恢复继续。
 
-![应用封面 / App Cover](project/public/showcase/hero-generated.jpg)
+## 当前状态
 
-## 效果图 / Showcase
+- 技术栈：Next.js 16 + React 19 + TypeScript。
+- 默认地址：`http://localhost:3006`。
+- 默认模型：文本 `gemini-3.1-flash-lite-preview`，生图 `gemini-3.1-flash-image-preview`。
+- 默认上游：`https://yunwu.ai/v1`。
+- 秘钥：只缓存在浏览器设置里，不写入本地历史。
+- 当前 UI：空页面是全屏上传入口；进入工作台后才显示语言、历史、设置、进度和右侧悬浮控制栏。
 
-![前后效果 / Before After](project/public/showcase/workflow-generated.jpg)
+## 快速启动
 
-## 中文说明
+直接双击根目录：
 
-### 项目定位
+```text
+启动图片翻译器.bat
+```
 
-这个项目主要解决：
+当前 bat 使用开发模式启动：
 
-- 商品图中的外文文案识别
-- 翻译后的原位替换
-- 批量处理与批量下载
+```bash
+cd project
+npm run dev -- --port 3006
+```
 
-当前主流程：
+开发模式内存会比较大，这是 Next dev 的正常情况。日常长期使用如果嫌内存大，可以改成生产模式：
 
-1. 文本模型做 OCR 与翻译
-2. 图片模型按原图版式重绘译文
+```bash
+cd project
+npm run build
+set PORT=3006
+npm run start
+```
 
-### 当前能力
+## 使用流程
 
-- 支持上传多张图片批量处理
-- 支持主文案 OCR 提取
-- 支持翻译后原位重绘
-- 支持单张下载和 ZIP 打包下载
-- 支持 Gemini 风格接口和部分兼容 relay
+1. 打开页面后，在全屏上传区选择图片或文件夹。
+2. 进入工作台后设置目标语言、比例、并发、模型和秘钥。
+3. 点击开始翻译。
+4. 每张图完成后会写入 `资源/` 和历史记录。
+5. 可以单张下载、下载已完成、或从历史恢复继续。
+6. 单图右键/操作菜单只处理当前图，不会误跑全批。
 
-### 推荐使用方式
+## 本地目录
 
-在当前 relay / model 组合下，优先使用：
+- `project/`：真实可运行的 Next.js 项目。
+- `资源/`：本地历史、原图、结果图、日志，不能随便删。
+- `codex/`：开发记录、踩坑和维护说明。
+- `.impeccable.md`：UI 设计方向与约束。
+- `AGENTS.md`：给 Codex/后续维护者的根目录规则。
 
-- `翻译重绘`
+## 哪些东西占空间
 
-这是当前最稳定的模式。
+- `project/node_modules/`：npm 依赖，通常几百 MB；删了要重新 `npm install`。
+- `project/.next/`：Next 编译缓存/构建产物；可以删，会重新生成。
+- `project/.codex-logs/`：Codex 日志；可以清理。
+- `资源/`：你的本地图片历史；不要乱删。
 
-### 启动方式
+## 维护文档
 
-直接双击根目录的：
-
-- `启动图片翻译器.bat`
-
-默认浏览器地址：
-
-- `http://localhost:3006`
-
-### 仓库结构
-
-- `project/`：真实可运行项目目录
-- `codex/`：开发记录、踩坑和规则文档
-- `启动图片翻译器.bat`：根目录启动器
-
----
-
-## English
-
-### What this project is for
-
-This project is built for localized e-commerce image workflows:
-
-- OCR text extraction from product images
-- translated in-place text replacement
-- batch processing and export
-
-Current pipeline:
-
-1. a text model performs OCR and translation
-2. an image model redraws translated text inside the original layout
-
-### Current features
-
-- batch image upload
-- OCR extraction for visible customer-facing text
-- in-place translated redraw
-- single download or ZIP export
-- Gemini-style gateway support and relay-friendly workflow
-
-### Recommended mode
-
-For the current relay / model setup, the recommended mode is:
-
-- `Translate and redraw`
-
-This is currently the most stable workflow.
-
-### How to run
-
-Double-click from the repository root:
-
-- `启动图片翻译器.bat`
-
-Default local URL:
-
-- `http://localhost:3006`
-
-### Repository layout
-
-- `project/`: actual runnable app
-- `codex/`: dev notes and pitfall logs
-- `启动图片翻译器.bat`: root launcher
-
-## More docs
-
-- Full project usage: `project/README.md`
-- Agent notes: `codex/AGENTS.md`
-- Dev log: `codex/DEV.md`
+- 项目详细说明：`project/README.md`
+- 当前状态快照：`codex/CURRENT_STATE.md`
+- Agent 规则：`AGENTS.md`
+- 开发记录：`codex/DEV.md`
+- 踩坑记录：`codex/AGENTS.md`

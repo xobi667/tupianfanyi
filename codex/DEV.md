@@ -86,3 +86,18 @@ More pitfall-oriented notes live in `AGENTS.md`.
 - Moved the main runnable project into `project`.
 - Root now keeps launcher files and `codex`.
 - Restored `codex` after accidental deletion and rebuilt its contents.
+
+## 2026-04-25
+
+### Documentation Refresh
+
+- Updated project documentation to match the current implementation:
+  - full-screen upload-only empty page
+  - post-upload workbench controls
+  - right-side hover drawer
+  - local history and resource persistence
+  - Next dev memory behavior
+  - safe cleanup list
+- Added root `AGENTS.md` so future Codex sessions have local project rules in the repository.
+- Added `codex/CURRENT_STATE.md` as a quick handoff snapshot.
+
