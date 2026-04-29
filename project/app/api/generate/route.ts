@@ -16,6 +16,13 @@ import {
 
 export const runtime = 'nodejs';
 
+const MAX_GENERATE_REQUEST_BODY_BYTES = 90 * 1024 * 1024;
+const MAX_INLINE_IMAGE_BYTES = 60 * 1024 * 1024;
+const MAX_REMOTE_IMAGE_BYTES = 60 * 1024 * 1024;
+const REMOTE_IMAGE_DOWNLOAD_TIMEOUT_MS = 20_000;
+const UPSTREAM_HOST_SAFETY_CACHE_MS = 60_000;
+const upstreamHostSafetyCache = new Map<string, { expiresAt: number; promise: Promise<void> }>();
+
 function errorResponse(message: string, status = 400) {
   return NextResponse.json(
     {
@@ -49,9 +56,20 @@ function summarizeRequestConfig(settings: Pick<GatewaySettings, 'requestHeadersT
   const queryKeys = Object.keys(parseRequestQueryParamsText(settings.requestQueryParamsText));
 
   return {
-    headerKeys,
-    queryKeys,
+    headerCount: headerKeys.length,
+    queryCount: queryKeys.length,
   };
+}
+
+function safeLogText(value: unknown, maxLength = 220) {
+  const text = String(value ?? '')
+    .replace(/data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+/g, '[image-data]')
+    .replace(/[A-Za-z0-9+/]{240,}={0,2}/g, '[base64]')
+    .replace(/((?:authorization|api[-_]?key|access[-_]?token|secret|token|key)\s*["']?\s*[:=]\s*["']?)[^"',\s}]+/gi, '$1[redacted]')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
 
 function toChineseContentsMode(contentsMode?: GatewayGenerateRequest['contentsMode']) {
@@ -177,6 +195,38 @@ function getTextPromptFromParts(parts: GatewayGenerateRequest['parts'] = []) {
 
 function getImageParts(parts: GatewayGenerateRequest['parts'] = []) {
   return parts.flatMap((part) => ('inlineData' in part ? [part.inlineData] : []));
+}
+
+function getBase64DecodedByteEstimate(base64Data: string) {
+  const normalizedBase64 = base64Data.replace(/\s/g, '');
+  const padding = normalizedBase64.endsWith('==') ? 2 : normalizedBase64.endsWith('=') ? 1 : 0;
+  return Math.floor((normalizedBase64.length * 3) / 4) - padding;
+}
+
+function validateInlineImageParts(parts: GatewayGenerateRequest['parts']) {
+  for (const part of parts) {
+    if (!part || typeof part !== 'object') {
+      throw new Error('请求内容格式无效。');
+    }
+
+    if (!('inlineData' in part)) continue;
+
+    const inlineData = part.inlineData as { mimeType?: unknown; data?: unknown };
+    const mimeType = String(inlineData.mimeType ?? '').toLowerCase();
+    const base64Data = String(inlineData.data ?? '');
+
+    if (!mimeType.startsWith('image/')) {
+      throw new Error('inlineData 只允许图片内容。');
+    }
+
+    if (!base64Data || !/^[A-Za-z0-9+/=\s]+$/.test(base64Data)) {
+      throw new Error('图片 base64 数据无效。');
+    }
+
+    if (getBase64DecodedByteEstimate(base64Data) > MAX_INLINE_IMAGE_BYTES) {
+      throw new Error('图片太大，单张最多 60 MB。');
+    }
+  }
 }
 
 function detectKnownImageMimeTypeFromBase64(base64Data: string) {
@@ -497,7 +547,7 @@ function buildOpenAiImagesPayload(body: Partial<GatewayGenerateRequest>) {
 }
 
 function isUnsafeIpAddress(address: string) {
-  const normalizedAddress = address.trim().toLowerCase().split('%')[0];
+  const normalizedAddress = address.trim().toLowerCase().replace(/^\[|\]$/g, '').split('%')[0];
   const family = isIP(normalizedAddress);
 
   if (family === 4) {
@@ -520,6 +570,11 @@ function isUnsafeIpAddress(address: string) {
   }
 
   if (family === 6) {
+    const mappedIpv4 = normalizedAddress.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (mappedIpv4?.[1]) {
+      return isUnsafeIpAddress(mappedIpv4[1]);
+    }
+
     return (
       normalizedAddress === '::' ||
       normalizedAddress === '::1' ||
@@ -542,6 +597,67 @@ function isUnsafeHostname(hostname: string) {
   );
 }
 
+async function assertPublicNetworkTarget(url: URL, label: string) {
+  if (!/^https?:$/.test(url.protocol)) {
+    throw new Error(`${label} 仅支持 http/https。`);
+  }
+
+  if (url.username || url.password) {
+    throw new Error(`${label} 不能包含账号信息。`);
+  }
+
+  if (isUnsafeHostname(url.hostname) || isUnsafeIpAddress(url.hostname)) {
+    throw new Error(`${label} 不能指向本机、内网或链路本地地址。`);
+  }
+
+  const cacheKey = `${url.protocol}//${url.hostname.toLowerCase()}`;
+  const cached = upstreamHostSafetyCache.get(cacheKey);
+
+  if (cached && cached.expiresAt > Date.now()) {
+    await cached.promise;
+    return;
+  }
+
+  const promise = (async () => {
+    const dnsResults = await lookup(url.hostname, {
+      all: true,
+      verbatim: true,
+    });
+
+    if (dnsResults.length === 0) {
+      throw new Error(`${label} 域名解析失败。`);
+    }
+
+    if (dnsResults.some((result) => isUnsafeIpAddress(result.address))) {
+      throw new Error(`${label} 不能解析到本机、内网或链路本地地址。`);
+    }
+  })();
+
+  upstreamHostSafetyCache.set(cacheKey, {
+    expiresAt: Date.now() + UPSTREAM_HOST_SAFETY_CACHE_MS,
+    promise,
+  });
+
+  try {
+    await promise;
+  } catch (error) {
+    upstreamHostSafetyCache.delete(cacheKey);
+    throw error;
+  }
+}
+
+async function validateApiBaseUrlTarget(apiBaseUrl: string) {
+  let parsedUrl: URL;
+
+  try {
+    parsedUrl = new URL(apiBaseUrl);
+  } catch {
+    throw new Error('API Base URL 格式无效。');
+  }
+
+  await assertPublicNetworkTarget(parsedUrl, 'API Base URL');
+}
+
 async function validateRemoteImageUrl(imageUrl: string) {
   let parsedUrl: URL;
 
@@ -555,28 +671,123 @@ async function validateRemoteImageUrl(imageUrl: string) {
     throw new Error('远程图片 URL 仅支持 https。');
   }
 
-  if (parsedUrl.username || parsedUrl.password) {
-    throw new Error('远程图片 URL 不能包含账号信息。');
-  }
-
-  if (isUnsafeHostname(parsedUrl.hostname) || isUnsafeIpAddress(parsedUrl.hostname)) {
-    throw new Error('远程图片 URL 不能指向本地或私网地址。');
-  }
-
-  const dnsResults = await lookup(parsedUrl.hostname, {
-    all: true,
-    verbatim: true,
-  });
-
-  if (dnsResults.length === 0) {
-    throw new Error('远程图片 URL 域名解析失败。');
-  }
-
-  if (dnsResults.some((result) => isUnsafeIpAddress(result.address))) {
-    throw new Error('远程图片 URL 不能解析到本地或私网地址。');
-  }
+  await assertPublicNetworkTarget(parsedUrl, '远程图片 URL');
 
   return parsedUrl.toString();
+}
+
+function getContentLengthBytes(response: Response) {
+  const rawContentLength = response.headers.get('content-length');
+  if (!rawContentLength) return null;
+  const contentLength = Number(rawContentLength);
+  return Number.isFinite(contentLength) && contentLength >= 0 ? contentLength : null;
+}
+
+async function readResponseBodyWithLimit(
+  response: Response,
+  maxBytes: number,
+  signal?: AbortSignal,
+) {
+  const contentLength = getContentLengthBytes(response);
+  if (contentLength !== null && contentLength > maxBytes) {
+    throw new Error(`远程图片太大，最多 ${Math.round(maxBytes / 1024 / 1024)} MB。`);
+  }
+
+  if (!response.body) {
+    const arrayBuffer = await response.arrayBuffer();
+    if (arrayBuffer.byteLength > maxBytes) {
+      throw new Error(`远程图片太大，最多 ${Math.round(maxBytes / 1024 / 1024)} MB。`);
+    }
+    return Buffer.from(arrayBuffer);
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  try {
+    while (true) {
+      if (signal?.aborted) {
+        throw new DOMException('The operation was aborted.', 'AbortError');
+      }
+
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error(`远程图片太大，最多 ${Math.round(maxBytes / 1024 / 1024)} MB。`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  return Buffer.concat(chunks, totalBytes);
+}
+
+function createDownloadAbortController(parentSignal?: AbortSignal) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REMOTE_IMAGE_DOWNLOAD_TIMEOUT_MS);
+  const abortFromParent = () => controller.abort(parentSignal?.reason);
+
+  if (parentSignal?.aborted) {
+    abortFromParent();
+  } else {
+    parentSignal?.addEventListener('abort', abortFromParent, { once: true });
+  }
+
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timeout);
+      parentSignal?.removeEventListener('abort', abortFromParent);
+    },
+  };
+}
+
+async function readRequestJsonWithLimit(request: Request, maxBytes: number) {
+  const rawContentLength = request.headers.get('content-length');
+  const contentLength = rawContentLength ? Number(rawContentLength) : 0;
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    throw new Error('请求体太大，请压缩图片后再试。');
+  }
+
+  if (!request.body) {
+    return JSON.parse(await request.text()) as unknown;
+  }
+
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder();
+  let totalBytes = 0;
+  let rawText = '';
+
+  try {
+    while (true) {
+      if (request.signal.aborted) {
+        throw new DOMException('The operation was aborted.', 'AbortError');
+      }
+
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error('请求体太大，请压缩图片后再试。');
+      }
+      rawText += decoder.decode(value, { stream: true });
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  rawText += decoder.decode();
+  return JSON.parse(rawText) as unknown;
 }
 
 async function fetchImageUrlAsGatewayResponse(
@@ -586,36 +797,52 @@ async function fetchImageUrlAsGatewayResponse(
   error?: { message?: string },
 ) {
   const safeImageUrl = await validateRemoteImageUrl(imageUrl);
-  const imageResponse = await fetch(safeImageUrl, {
-    headers: {
-      Accept: 'image/*',
-    },
-    redirect: 'error',
-    signal,
-  });
+  const downloadAbort = createDownloadAbortController(signal);
 
-  if (!imageResponse.ok) {
-    throw new Error(`远程图片 URL 抓取失败 (${imageResponse.status}).`);
+  try {
+    const imageResponse = await fetch(safeImageUrl, {
+      headers: {
+        Accept: 'image/*',
+      },
+      redirect: 'error',
+      signal: downloadAbort.signal,
+    });
+
+    if (!imageResponse.ok) {
+      throw new Error(`远程图片 URL 抓取失败 (${imageResponse.status}).`);
+    }
+
+    const contentType = imageResponse.headers.get('content-type')?.split(';')[0]?.trim();
+    if (contentType && !contentType.startsWith('image/')) {
+      throw new Error(`远程图片 URL 返回的 content-type 不是图片: ${contentType}`);
+    }
+
+    const imageBuffer = await readResponseBodyWithLimit(
+      imageResponse,
+      MAX_REMOTE_IMAGE_BYTES,
+      downloadAbort.signal,
+    );
+    const base64Data = imageBuffer.toString('base64');
+    const sniffedMimeType = detectKnownImageMimeTypeFromBase64(base64Data);
+
+    const mimeType = contentType && contentType.startsWith('image/')
+      ? contentType
+      : sniffedMimeType;
+
+    if (!mimeType) {
+      throw new Error('远程图片 URL 返回的内容不是有效的图片。');
+    }
+
+    return buildGatewayImageResponse(base64Data, mimeType, finishReason, error);
+  } catch (fetchError) {
+    if (isAbortLikeError(fetchError) && !signal?.aborted) {
+      throw new Error('远程图片 URL 下载超时。');
+    }
+
+    throw fetchError;
+  } finally {
+    downloadAbort.dispose();
   }
-
-  const arrayBuffer = await imageResponse.arrayBuffer();
-  const base64Data = Buffer.from(arrayBuffer).toString('base64');
-  const contentType = imageResponse.headers.get('content-type')?.split(';')[0]?.trim();
-  const sniffedMimeType = detectKnownImageMimeTypeFromBase64(base64Data);
-
-  if (contentType && !contentType.startsWith('image/')) {
-    throw new Error(`远程图片 URL 返回的 content-type 不是图片: ${contentType}`);
-  }
-
-  const mimeType = contentType && contentType.startsWith('image/')
-    ? contentType
-    : sniffedMimeType;
-
-  if (!mimeType) {
-    throw new Error('远程图片 URL 返回的内容不是有效的图片。');
-  }
-
-  return buildGatewayImageResponse(base64Data, mimeType, finishReason, error);
 }
 
 type OpenAiCompatibleResponsePayload = {
@@ -902,7 +1129,21 @@ export async function POST(request: Request) {
     .slice(2, 8)}`;
 
   try {
-    const body = (await request.json()) as Partial<GatewayGenerateRequest>;
+    let body: Partial<GatewayGenerateRequest>;
+
+    try {
+      body = (await readRequestJsonWithLimit(
+        request,
+        MAX_GENERATE_REQUEST_BODY_BYTES,
+      )) as Partial<GatewayGenerateRequest>;
+    } catch (error) {
+      if (isAbortLikeError(error)) throw error;
+      const message = error instanceof Error ? error.message : '请求体 JSON 格式无效。';
+      return errorResponse(
+        message.includes('请求体太大') ? message : '请求体 JSON 格式无效。',
+        message.includes('请求体太大') ? 413 : 400,
+      );
+    }
 
     if (!body || typeof body !== 'object') {
       return errorResponse('请求体不能为空。');
@@ -920,7 +1161,18 @@ export async function POST(request: Request) {
       return errorResponse('缺少请求内容。');
     }
 
+    try {
+      validateInlineImageParts(body.parts);
+    } catch (error) {
+      return errorResponse(error instanceof Error ? error.message : '请求图片无效。');
+    }
+
     const settings = normalizeSettings(body.settings);
+    try {
+      await validateApiBaseUrlTarget(settings.apiBaseUrl);
+    } catch (error) {
+      return errorResponse(error instanceof Error ? error.message : 'API Base URL 不安全。');
+    }
     const logPrefix = createLogPrefix(requestId);
     const startedAt = Date.now();
     const targetUrl = buildGatewayUrl(settings.apiBaseUrl, body.model, settings);
@@ -948,9 +1200,7 @@ export async function POST(request: Request) {
     console.log(`${logPrefix} 请求分类: ${toChineseDebugLabel(body.debugLabel)}`);
     console.log(`${logPrefix} 模型名称: ${body.model.trim()}`);
     console.log(`${logPrefix} 请求地址: ${target.origin}${target.pathname}`);
-    console.log(
-      `${logPrefix} 请求头键: ${requestConfigSummary.headerKeys.join(', ') || '无'}；URL 参数键: ${requestConfigSummary.queryKeys.join(', ') || '无'}`,
-    );
+    console.log(`${logPrefix} 自定义请求配置: 请求头 ${requestConfigSummary.headerCount} 项，URL 参数 ${requestConfigSummary.queryCount} 项`);
     console.log(`${logPrefix} 内容格式: ${toChineseContentsMode(body.contentsMode)}`);
     console.log(
       `${logPrefix} 文本片段数: ${partSummary.textParts}，图片片段数: ${partSummary.imageParts}`,
@@ -978,6 +1228,7 @@ export async function POST(request: Request) {
         method: 'POST',
         headers: imagesHeaders,
         body: imagesPayload.body,
+        redirect: 'error',
         signal: request.signal,
       });
 
@@ -987,6 +1238,7 @@ export async function POST(request: Request) {
       try {
         normalized = await normalizeOpenAiCompatibleResponse(rawText, request.signal);
       } catch (error) {
+        if (isAbortLikeError(error)) throw error;
         return buildInvalidUpstreamResponse(
           requestId,
           error instanceof Error ? error.message : '上游返回了无法解析的图片响应。',
@@ -1003,7 +1255,7 @@ export async function POST(request: Request) {
       console.log(`${logPrefix} Finish reason: ${toChineseFinishReasons(responseSummary.finishReasons)}`);
       console.log(`${logPrefix} Returned image: ${responseSummary.hasImage ? 'yes' : 'no'}`);
       if (responseSummary.errorMessage) {
-        console.log(`${logPrefix} Upstream error: ${responseSummary.errorMessage}`);
+        console.log(`${logPrefix} Upstream error: ${safeLogText(responseSummary.errorMessage)}`);
       }
 
       if (upstreamResponse.ok && normalized && responseSummary.hasImage) {
@@ -1042,6 +1294,7 @@ export async function POST(request: Request) {
         method: 'POST',
         headers: buildGatewayHeaders(settings),
         body: JSON.stringify(buildOpenAiImagePayload(body)),
+        redirect: 'error',
         signal: request.signal,
       });
 
@@ -1051,6 +1304,7 @@ export async function POST(request: Request) {
       try {
         normalized = await normalizeOpenAiCompatibleResponse(rawText, request.signal);
       } catch (error) {
+        if (isAbortLikeError(error)) throw error;
         return buildInvalidUpstreamResponse(
           requestId,
           error instanceof Error ? error.message : '上游返回了无法解析的图片响应。',
@@ -1067,7 +1321,7 @@ export async function POST(request: Request) {
       console.log(`${logPrefix} Finish reason: ${toChineseFinishReasons(responseSummary.finishReasons)}`);
       console.log(`${logPrefix} Returned image: ${responseSummary.hasImage ? 'yes' : 'no'}`);
       if (responseSummary.errorMessage) {
-        console.log(`${logPrefix} Upstream error: ${responseSummary.errorMessage}`);
+        console.log(`${logPrefix} Upstream error: ${safeLogText(responseSummary.errorMessage)}`);
       }
 
       if (upstreamResponse.ok && normalized && responseSummary.hasImage) {
@@ -1109,6 +1363,7 @@ export async function POST(request: Request) {
         method: 'POST',
         headers: buildGatewayHeaders(settings),
         body: JSON.stringify(requestPayload),
+        redirect: 'error',
         signal: request.signal,
       });
 
@@ -1125,7 +1380,7 @@ export async function POST(request: Request) {
       console.log(`${logPrefix} 结束原因: ${toChineseFinishReasons(responseSummary.finishReasons)}`);
       console.log(`${logPrefix} 是否返回图片: ${responseSummary.hasImage ? '是' : '否'}`);
       if (responseSummary.errorMessage) {
-        console.log(`${logPrefix} 上游错误信息: ${responseSummary.errorMessage}`);
+        console.log(`${logPrefix} 上游错误信息: ${safeLogText(responseSummary.errorMessage)}`);
       }
 
       if (!upstreamResponse.ok) {
@@ -1188,7 +1443,7 @@ export async function POST(request: Request) {
     if (isNetworkLikeError(error)) {
       console.error(`${createLogPrefix(requestId)} 上游网络异常`);
       console.error(
-        `${createLogPrefix(requestId)} ${error instanceof Error ? error.message : String(error)}`,
+        `${createLogPrefix(requestId)} ${safeLogText(error instanceof Error ? error.message : String(error))}`,
       );
       return NextResponse.json(
         {
@@ -1205,7 +1460,7 @@ export async function POST(request: Request) {
 
     console.error(`${createLogPrefix(requestId)} 请求异常`);
     console.error(
-      `${createLogPrefix(requestId)} ${error instanceof Error ? error.message : String(error)}`,
+      `${createLogPrefix(requestId)} ${safeLogText(error instanceof Error ? error.message : String(error))}`,
     );
     return NextResponse.json(
       {

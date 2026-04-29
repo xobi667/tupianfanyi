@@ -167,3 +167,20 @@ Every small change should append a new entry instead of overwriting history.
   - only project-owned Markdown files were updated
   - documented current UI, history persistence, memory notes, safe cleanup targets, and encoding rules
 
+## 2026-04-25 Entry: Cleanup, Docs, Continue Fix
+
+- Trigger: user requested full cleanup, Markdown refresh, DEV log, and direct fixes for broken logic.
+- What changed:
+  - cleaned logs/screenshots/cache artifacts
+  - refreshed root/project/Codex docs
+  - fixed continue flow so pure paused tasks continue directly
+  - added right-click `继续选中`
+  - sent AbortSignal into the direct remove/redraw branch
+- What went wrong:
+  - previous pause/continue UX could still feel like a new start in some scoped flows
+  - one image branch still missed cancellation signal
+  - root ignore file had Chinese display risk
+- Final fix:
+  - direct continue path for paused-only scope
+  - explicit context-menu continue
+  - UTF-8 docs and ignore rules

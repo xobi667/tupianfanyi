@@ -1,16 +1,18 @@
 'use client';
 
+/* eslint-disable @next/next/no-img-element -- Local data URL previews are faster with native lazy images. */
 import {
   useCallback,
   useEffect,
   useMemo,
+  memo,
   useRef,
   useState,
   type ChangeEvent,
   type DragEvent,
+  type KeyboardEvent,
   type MouseEvent,
 } from 'react';
-import Image from 'next/image';
 import JSZip from 'jszip';
 import {
   Archive,
@@ -23,6 +25,7 @@ import {
   Loader2,
   PauseCircle,
   Pencil,
+  PlayCircle,
   RefreshCw,
   Settings,
   Sparkles,
@@ -52,6 +55,7 @@ type TaskStatus =
   | 'success'
   | 'error';
 type ProcessMode = 'translate_and_remove' | 'translate_only' | 'remove_only';
+type BatchRunState = 'idle' | 'running' | 'paused' | 'completed';
 type ConnectionStatus = 'idle' | 'testing' | 'success' | 'error';
 type ConnectionTestMode = 'quick' | 'full';
 type OutputAspectRatio =
@@ -155,11 +159,25 @@ interface RemovedTaskRecord {
   index: number;
 }
 
-interface SelectionBoxState {
-  startX: number;
-  startY: number;
-  currentX: number;
-  currentY: number;
+interface SelectionBounds {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+}
+
+interface SelectionRect {
+  id: string;
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+  element?: HTMLElement;
+}
+
+interface TaskGroup {
+  groupLabel: string;
+  tasks: ImageTask[];
 }
 
 interface TaskMenuState {
@@ -178,6 +196,22 @@ interface StartConfirmState {
 
 interface ReturnHomeConfirmState {
   hasWorkspace: boolean;
+}
+
+interface ConfirmDialogState {
+  title: string;
+  message: string;
+  confirmLabel: string;
+  cancelLabel?: string;
+  tone?: 'danger' | 'default';
+  onConfirm: () => Promise<void> | void;
+}
+
+interface HistoryPreviewImage {
+  id: string;
+  name: string;
+  dataUrl: string | null;
+  kind: 'result' | 'original';
 }
 
 interface HistoryImageRecord {
@@ -217,6 +251,12 @@ interface HistoryTaskRecord {
   failCount: number;
   copiedCount: number;
   status: 'idle' | 'running' | 'partial' | 'done' | 'failed';
+  storageDirName?: string;
+  previewImages?: HistoryPreviewImage[];
+  hasMoreImages?: boolean;
+  imageOffset?: number;
+  imageLimit?: number;
+  totalImages?: number;
   images: HistoryImageRecord[];
 }
 
@@ -258,6 +298,8 @@ const RETRY_DELAYS_MS = [2000, 5000, 10000, 20000];
 const MAX_UPLOAD_BATCH_COUNT = 1000;
 const MAX_SINGLE_IMAGE_SIZE_BYTES = 60 * 1024 * 1024;
 const UPLOAD_READ_CONCURRENCY = 3;
+const HISTORY_LIST_PAGE_SIZE = 60;
+const HISTORY_DETAIL_PAGE_SIZE = 24;
 const SUPPORTED_IMAGE_EXTENSIONS = new Set([
   'jpg',
   'jpeg',
@@ -448,6 +490,10 @@ function normalizeRelativePath(relativePath: string) {
   return relativePath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
 }
 
+function sanitizePathSegment(value: string) {
+  return value.trim().replace(/[<>:"\/\\|?*\x00-\x1F]/g, '_').replace(/\s+/g, ' ').slice(0, 80) || 'history_project';
+}
+
 function getPathKey(relativePath: string) {
   return normalizeRelativePath(relativePath).toLowerCase();
 }
@@ -577,7 +623,22 @@ function resolveOutputRelativePath(relativePath: string, dataUrl?: string) {
 }
 
 function getErrorMessage(error: unknown) {
-  return error instanceof Error ? error.message : '请求失败，请稍后重试。';
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  if (
+    /failed to fetch|load failed|networkerror|fetch failed|network request failed/i.test(message)
+  ) {
+    return '网络请求失败：请检查本地服务、上游接口地址或网络连接。';
+  }
+  if (/aborted|aborterror/i.test(message)) {
+    return '请求已取消或超时。';
+  }
+  return message.trim() || '请求失败，请稍后重试。';
+}
+
+function getGlobalMessageTone(message: string) {
+  return /失败|错误|异常|无效|不能|缺少|不存在|太大|读取失败|保存失败|连接失败|超时|限流/.test(message)
+    ? 'error'
+    : 'info';
 }
 
 function getResponseText(response: GatewayGenerateResponse) {
@@ -661,6 +722,29 @@ function getHistoryStatusText(status: HistoryTaskRecord['status']) {
   if (status === 'partial') return '部分完成';
   if (status === 'failed') return '全部失败';
   return '待翻译';
+}
+
+function getHistoryPreviewImages(task: HistoryTaskRecord) {
+  return task.previewImages?.filter((image) => image.dataUrl) ?? [];
+}
+
+function mergeHistoryTaskImages(
+  currentTask: HistoryTaskRecord | undefined,
+  incomingTask: HistoryTaskRecord,
+  appendImages: boolean,
+) {
+  if (!appendImages || !currentTask) return incomingTask;
+  const imageMap = new Map(currentTask.images.map((image) => [image.id, image]));
+  incomingTask.images.forEach((image) => {
+    const existing = imageMap.get(image.id);
+    imageMap.set(image.id, existing ? { ...existing, ...image } : image);
+  });
+
+  return {
+    ...incomingTask,
+    previewImages: incomingTask.previewImages?.length ? incomingTask.previewImages : currentTask.previewImages,
+    images: Array.from(imageMap.values()),
+  };
 }
 
 async function postHistory(action: string, payload: Record<string, unknown>) {
@@ -1022,10 +1106,10 @@ function createAdaptiveLimiter(initialLimit: number) {
 
 function buildAspectRatioInstruction(outputAspectRatio: OutputAspectRatio) {
   if (outputAspectRatio === 'original') {
-    return 'Keep the same canvas size and the same aspect ratio as the source image.';
+    return 'Keep the same canvas size and the same aspect ratio as the source image. Do not crop, trim, cover, or move any important text or product area.';
   }
 
-  return `Adapt the final output to a ${outputAspectRatio} aspect ratio. You may recompose or expand the frame as needed, but keep the product fully visible and preserve the overall layout intent.`;
+  return `Adapt the final output to a ${outputAspectRatio} aspect ratio by extending padding/background or recomposing safely. Never hard-crop, trim, cover, or cut off any important text, product edge, logo, or label. Keep all translated text fully visible and preserve the overall layout intent.`;
 }
 
 function buildImagePrompt({
@@ -1217,7 +1301,6 @@ function buildImagePartVariants({
     label: string;
     text: string;
   }>;
-  signal?: AbortSignal;
 }) {
   return promptVariants.map((promptVariant) => ({
     label: promptVariant.label,
@@ -1530,12 +1613,240 @@ async function runWithConcurrencyLimit<T>(
   return results;
 }
 
+interface LocalPreviewImageProps {
+  src: string;
+  alt: string;
+  className?: string;
+}
+
+const LocalPreviewImage = memo(function LocalPreviewImage({
+  src,
+  alt,
+  className,
+}: LocalPreviewImageProps) {
+  return (
+    <img
+      src={src}
+      alt={alt}
+      loading="lazy"
+      decoding="async"
+      draggable={false}
+      className={cn('absolute inset-0 h-full w-full object-contain', className)}
+    />
+  );
+});
+
+function isBlankSelectionSurfaceClick(
+  event: MouseEvent<HTMLElement>,
+  protectedSelector: string,
+) {
+  const target = event.target instanceof Element ? event.target : null;
+  if (!target || !event.currentTarget.contains(target)) return false;
+  return !target.closest(
+    `${protectedSelector},button,input,textarea,select,a,[role="menu"],[data-no-clear-selection]`,
+  );
+}
+
+const FOCUSABLE_DIALOG_SELECTOR = [
+  'a[href]',
+  'button:not(:disabled)',
+  'input:not(:disabled)',
+  'select:not(:disabled)',
+  'textarea:not(:disabled)',
+  '[tabindex]:not([tabindex="-1"])',
+].join(',');
+
+function getFocusableDialogElements(root: HTMLElement) {
+  return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_DIALOG_SELECTOR))
+    .filter((element) => !element.hasAttribute('disabled') && element.getClientRects().length > 0);
+}
+
+function trapFocusInDialog(event: globalThis.KeyboardEvent, root: HTMLElement) {
+  if (event.key !== 'Tab') return;
+
+  const focusable = getFocusableDialogElements(root);
+  if (focusable.length === 0) {
+    event.preventDefault();
+    root.focus();
+    return;
+  }
+
+  const firstElement = focusable[0];
+  const lastElement = focusable[focusable.length - 1];
+  const activeElement = document.activeElement;
+
+  if (event.shiftKey && activeElement === firstElement) {
+    event.preventDefault();
+    lastElement.focus();
+    return;
+  }
+
+  if (!event.shiftKey && activeElement === lastElement) {
+    event.preventDefault();
+    firstElement.focus();
+  }
+}
+
+interface TaskCardProps {
+  task: ImageTask;
+  selected: boolean;
+  isProcessingBatch: boolean;
+  cardSizeClass: string;
+  onToggle: (taskId: string, event: MouseEvent<HTMLElement>) => void;
+  onOpenMenu: (event: MouseEvent, taskId: string) => void;
+  onOpenKeyboardMenu: (taskId: string, element: HTMLElement) => void;
+  onRemove: (taskId: string) => void;
+  onDownload: (task: ImageTask) => void;
+}
+
+const TaskCard = memo(function TaskCard({
+  task,
+  selected,
+  isProcessingBatch,
+  cardSizeClass,
+  onToggle,
+  onOpenMenu,
+  onOpenKeyboardMenu,
+  onRemove,
+  onDownload,
+}: TaskCardProps) {
+  return (
+    <article
+      data-task-id={task.id}
+      data-task-card
+      role="button"
+      tabIndex={0}
+      aria-pressed={selected}
+      onClick={(event) => onToggle(task.id, event)}
+      onKeyDown={(event: KeyboardEvent<HTMLElement>) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onToggle(task.id, event as unknown as MouseEvent<HTMLElement>);
+        }
+        if (event.key === 'F10' && event.shiftKey) {
+          event.preventDefault();
+          onOpenKeyboardMenu(task.id, event.currentTarget);
+        }
+      }}
+      onContextMenu={(event) => onOpenMenu(event, task.id)}
+      className={cn(
+        'ui-task-card overflow-hidden rounded-[20px] border border-white/10 transition-[border-color,box-shadow,background-color] duration-200 hover:border-emerald-400/35 hover:shadow-[0_10px_36px_rgba(0,0,0,0.55)]',
+        cardSizeClass,
+        selected && 'ui-task-card-selected',
+      )}
+    >
+      <div className="flex h-10 items-center gap-2 border-b border-white/10 px-3">
+        <span className={cn('flex h-4 w-4 shrink-0 items-center justify-center rounded border text-[10px] transition', selected ? 'border-emerald-300 bg-emerald-400 text-black' : 'border-white/15 bg-white/[0.03] text-transparent')}>✓</span>
+        <div className="min-w-0 flex-1 truncate text-[11px] text-white/58" title={task.relativePath}>{task.file.name}</div>
+        <button type="button" aria-label={`从工作台移除 ${task.file.name}`} title="从工作台移除" onClick={(event) => { event.stopPropagation(); onRemove(task.id); }} disabled={isProcessingBatch} className="flex min-h-9 min-w-9 items-center justify-center rounded-lg text-white/28 transition hover:bg-red-500/10 hover:text-red-300 disabled:opacity-40"><Trash2 className="h-3.5 w-3.5" /></button>
+      </div>
+
+      <div className="grid grid-cols-2 gap-1 bg-black/70 p-1">
+        <div className="ui-preview-pane relative flex aspect-square min-h-0 items-center justify-center overflow-hidden rounded-xl">
+          <span className="absolute left-2 top-2 z-10 rounded bg-black/65 px-1.5 py-0.5 text-[9px] text-white/55">原图</span>
+          <LocalPreviewImage src={task.preview} alt="Original" className="p-3" />
+        </div>
+        <div className="ui-preview-pane ui-preview-result relative flex aspect-square min-h-0 items-center justify-center overflow-hidden rounded-xl">
+          <span className="absolute left-2 top-2 z-10 rounded bg-emerald-600/85 px-1.5 py-0.5 text-[9px] text-white">结果</span>
+          {task.generatedUrl ? <LocalPreviewImage src={task.generatedUrl} alt="Generated" className="p-3" /> : task.status === 'generating' || task.status === 'extracting' || task.status === 'detecting' ? <Loader2 className="h-5 w-5 animate-spin text-emerald-300" /> : <ImageIcon className="h-6 w-6 text-white/14" />}
+        </div>
+      </div>
+
+      <div className="px-2.5 py-2">
+        {task.result?.extractedText && <div className="mb-2 truncate rounded-lg border border-white/8 bg-white/[0.03] px-2 py-1.5 text-[10px] text-white/38">识别：{task.result.extractedText.slice(0, 96)}{task.result.extractedText.length > 96 ? '...' : ''}</div>}
+        <div className="flex items-center justify-between gap-2">
+          <div className="min-w-0 flex-1 truncate text-[11px]">
+            {task.status === 'idle' && <span className="text-white/28">等待处理</span>}
+            {task.status === 'detecting' && <span className="text-emerald-200">正在识别是否有字...</span>}
+            {task.status === 'retrying' && <span className="text-amber-300" title={task.error}>{task.error ?? '正在等待自动重试...'}</span>}
+            {task.status === 'paused' && <span className="text-amber-200">已暂停</span>}
+            {task.status === 'extracting' && <span className="text-emerald-200">正在提取原文并翻译...</span>}
+            {task.status === 'generating' && <span className="text-emerald-200">正在 AI 翻译重绘...</span>}
+            {task.status === 'copied' && <span className="text-sky-300">无字图片，已复制</span>}
+            {task.status === 'success' && <span className="text-emerald-300">翻译完成</span>}
+            {task.status === 'error' && <span className="text-red-300" title={task.error}>{task.error}{task.retryCount > 0 ? ` / 已重试 ${task.retryCount} 次` : ''}</span>}
+          </div>
+          <button type="button" onClick={(event) => { event.stopPropagation(); onOpenMenu(event, task.id); }} className="min-h-8 rounded-lg border border-white/10 px-3 py-1 text-[11px] text-white/48 transition hover:bg-white/[0.06] hover:text-white/75">操作</button>
+          {(task.status === 'success' || task.status === 'copied') && <button type="button" aria-label={`下载 ${task.file.name} 的结果图`} onClick={(event) => { event.stopPropagation(); onDownload(task); }} className="flex min-h-9 min-w-9 items-center justify-center rounded-lg text-emerald-200 transition hover:bg-emerald-500/10 hover:text-white" title="下载当前图片"><Download className="h-3.5 w-3.5" /></button>}
+        </div>
+      </div>
+    </article>
+  );
+}, (previous, next) =>
+  previous.task === next.task &&
+  previous.selected === next.selected &&
+  previous.isProcessingBatch === next.isProcessingBatch &&
+  previous.cardSizeClass === next.cardSizeClass
+);
+
+interface TaskGroupsViewProps {
+  groupedTasks: TaskGroup[];
+  selectedTaskIds: Set<string>;
+  isProcessingBatch: boolean;
+  canvasGridClass: string;
+  cardSizeClass: string;
+  onToggle: (taskId: string, event: MouseEvent<HTMLElement>) => void;
+  onOpenMenu: (event: MouseEvent, taskId: string) => void;
+  onOpenKeyboardMenu: (taskId: string, element: HTMLElement) => void;
+  onRemove: (taskId: string) => void;
+  onDownload: (task: ImageTask) => void;
+}
+
+const TaskGroupsView = memo(function TaskGroupsView({
+  groupedTasks,
+  selectedTaskIds,
+  isProcessingBatch,
+  canvasGridClass,
+  cardSizeClass,
+  onToggle,
+  onOpenMenu,
+  onOpenKeyboardMenu,
+  onRemove,
+  onDownload,
+}: TaskGroupsViewProps) {
+  return (
+    <>
+      {groupedTasks.map((group) => (
+        <div key={group.groupLabel} className="space-y-2">
+          {groupedTasks.length > 1 && <div className="flex items-center justify-between gap-3 px-1">
+            <h2 className="rounded-full border border-white/10 bg-white/[0.035] px-3 py-1 text-xs font-medium text-white/70">{group.groupLabel} · {group.tasks.length}</h2>
+          </div>}
+
+          <div className={canvasGridClass}>
+            {group.tasks.map((task) => (
+              <TaskCard
+                key={task.id}
+                task={task}
+                selected={selectedTaskIds.has(task.id)}
+                isProcessingBatch={isProcessingBatch}
+                cardSizeClass={cardSizeClass}
+                onToggle={onToggle}
+                onOpenMenu={onOpenMenu}
+                onOpenKeyboardMenu={onOpenKeyboardMenu}
+                onRemove={onRemove}
+                onDownload={onDownload}
+              />
+            ))}
+          </div>
+        </div>
+      ))}
+    </>
+  );
+}, (previous, next) =>
+  previous.groupedTasks === next.groupedTasks &&
+  previous.selectedTaskIds === next.selectedTaskIds &&
+  previous.isProcessingBatch === next.isProcessingBatch &&
+  previous.canvasGridClass === next.canvasGridClass &&
+  previous.cardSizeClass === next.cardSizeClass
+);
+
 export default function ImageTranslator() {
   const [tasks, setTasks] = useState<ImageTask[]>([]);
   const [targetLanguage, setTargetLanguage] = useState('中文');
   const [outputAspectRatio, setOutputAspectRatio] =
     useState<OutputAspectRatio>('original');
   const [isProcessingBatch, setIsProcessingBatch] = useState(false);
+  const [batchRunState, setBatchRunState] = useState<BatchRunState>('idle');
   const [globalError, setGlobalError] = useState<string | null>(null);
   const processMode = 'translate_only' as ProcessMode;
   const [settings, setSettings] = useState<GatewaySettings>(DEFAULT_SETTINGS);
@@ -1555,22 +1866,32 @@ export default function ImageTranslator() {
   const [nowTimestamp, setNowTimestamp] = useState(() => Date.now());
   const [activeHistoryTaskId, setActiveHistoryTaskId] = useState<string | null>(null);
   const [historyTasks, setHistoryTasks] = useState<HistoryTaskRecord[]>([]);
+  const [historyListCursor, setHistoryListCursor] = useState<number | null>(null);
+  const [historyHasMore, setHistoryHasMore] = useState(false);
+  const [historyTotalCount, setHistoryTotalCount] = useState(0);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historyLogs, setHistoryLogs] = useState('');
   const [selectedHistoryLogs, setSelectedHistoryLogs] = useState('');
   const [resourceDir, setResourceDir] = useState('');
   const [historyLoading, setHistoryLoading] = useState(false);
   const [selectedHistoryTaskId, setSelectedHistoryTaskId] = useState<string | null>(null);
+  const [selectedHistoryTaskIds, setSelectedHistoryTaskIds] = useState<Set<string>>(() => new Set());
+  const [historyMenu, setHistoryMenu] = useState<TaskMenuState | null>(null);
   const [historyDetailTaskIds, setHistoryDetailTaskIds] = useState<Set<string>>(() => new Set());
+  const [historyDetailHasMore, setHistoryDetailHasMore] = useState(false);
+  const [historyDetailLoadingMore, setHistoryDetailLoadingMore] = useState(false);
   const [activeProjectName, setActiveProjectName] = useState('');
   const [draftProjectName, setDraftProjectName] = useState('');
   const [isEditingProjectName, setIsEditingProjectName] = useState(false);
   const [pendingUpload, setPendingUpload] = useState<PendingUpload | null>(null);
   const [startConfirm, setStartConfirm] = useState<StartConfirmState | null>(null);
   const [returnHomeConfirm, setReturnHomeConfirm] = useState<ReturnHomeConfirmState | null>(null);
+  const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null);
+  const [isConfirming, setIsConfirming] = useState(false);
+  const [mobileConsoleOpen, setMobileConsoleOpen] = useState(false);
+  const [desktopConsoleOpen, setDesktopConsoleOpen] = useState(false);
   const [taskMenu, setTaskMenu] = useState<TaskMenuState | null>(null);
   const [selectedTaskIds, setSelectedTaskIds] = useState<Set<string>>(() => new Set());
-  const [selectionBox, setSelectionBox] = useState<SelectionBoxState | null>(null);
   const [undoStack, setUndoStack] = useState<RemovedTaskRecord[][]>([]);
   const [softDeletedTasks, setSoftDeletedTasks] = useState<RemovedTaskRecord[]>([]);
 
@@ -1579,13 +1900,116 @@ export default function ImageTranslator() {
   const workbenchRef = useRef<HTMLElement>(null);
   const settingsButtonRef = useRef<HTMLButtonElement>(null);
   const settingsDialogRef = useRef<HTMLFormElement>(null);
+  const confirmDialogRef = useRef<HTMLDivElement>(null);
+  const startConfirmDialogRef = useRef<HTMLDivElement>(null);
+  const returnHomeDialogRef = useRef<HTMLDivElement>(null);
+  const pendingUploadDialogRef = useRef<HTMLDivElement>(null);
+  const historyDialogRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLElement>(null);
+  const historyGalleryRef = useRef<HTMLElement>(null);
+  const selectionOverlayRef = useRef<HTMLDivElement>(null);
   const tasksRef = useRef<ImageTask[]>([]);
+  const taskRenderFrameRef = useRef<number | null>(null);
   const selectedTaskIdsRef = useRef<Set<string>>(new Set());
+  const selectedHistoryTaskIdsRef = useRef<Set<string>>(new Set());
   const softDeletedTasksRef = useRef<RemovedTaskRecord[]>([]);
   const activeTaskControllersRef = useRef<Map<string, AbortController>>(new Map());
+  const historyRefreshTimerRef = useRef<number | null>(null);
+  const historyRefreshPromiseRef = useRef<Promise<HistoryTaskRecord[]> | null>(null);
+  const historyRefreshAgainRef = useRef(false);
+  const consoleCloseTimerRef = useRef<number | null>(null);
   const selectionDragRef = useRef<{ startX: number; startY: number; additive: boolean; isSelecting: boolean } | null>(null);
+  const taskSelectionRectsRef = useRef<SelectionRect[]>([]);
+  const taskSelectionElementMapRef = useRef<Map<string, HTMLElement>>(new Map());
+  const taskSelectionBaseIdsRef = useRef<Set<string>>(new Set());
+  const taskSelectionLiveIdsRef = useRef<Set<string> | null>(null);
+  const taskSelectionFrameRef = useRef<number | null>(null);
+  const taskSelectionPointRef = useRef<{ clientX: number; clientY: number } | null>(null);
+  const historySelectionDragRef = useRef<{ startX: number; startY: number; additive: boolean; isSelecting: boolean } | null>(null);
+  const historySelectionRectsRef = useRef<SelectionRect[]>([]);
+  const historySelectionElementMapRef = useRef<Map<string, HTMLElement>>(new Map());
+  const historySelectionBaseIdsRef = useRef<Set<string>>(new Set());
+  const historySelectionLiveIdsRef = useRef<Set<string> | null>(null);
+  const historySelectionFrameRef = useRef<number | null>(null);
+  const historySelectionPointRef = useRef<{ clientX: number; clientY: number } | null>(null);
   const selectionSuppressClickRef = useRef(false);
+
+  const scheduleTasksRender = useCallback(() => {
+    if (taskRenderFrameRef.current !== null) return;
+    taskRenderFrameRef.current = window.requestAnimationFrame(() => {
+      taskRenderFrameRef.current = null;
+      setTasks(tasksRef.current);
+    });
+  }, []);
+
+  const closeConfirmDialog = useCallback(() => {
+    if (isConfirming) return;
+    setConfirmDialog(null);
+  }, [isConfirming]);
+
+  const openConfirmDialog = useCallback((dialog: ConfirmDialogState) => {
+    setHistoryMenu(null);
+    setTaskMenu(null);
+    setConfirmDialog(dialog);
+  }, []);
+
+  const runConfirmDialogAction = useCallback(async () => {
+    if (!confirmDialog || isConfirming) return;
+    setIsConfirming(true);
+    try {
+      await confirmDialog.onConfirm();
+      setConfirmDialog(null);
+    } catch (error) {
+      setGlobalError(getErrorMessage(error));
+    } finally {
+      setIsConfirming(false);
+    }
+  }, [confirmDialog, isConfirming]);
+
+  const clearConsoleCloseTimer = useCallback(() => {
+    if (consoleCloseTimerRef.current === null) return;
+    window.clearTimeout(consoleCloseTimerRef.current);
+    consoleCloseTimerRef.current = null;
+  }, []);
+
+  const openDesktopConsole = useCallback(() => {
+    if (window.matchMedia('(max-width: 1279px)').matches) return;
+    clearConsoleCloseTimer();
+    setDesktopConsoleOpen(true);
+  }, [clearConsoleCloseTimer]);
+
+  const closeDesktopConsole = useCallback(() => {
+    clearConsoleCloseTimer();
+    setDesktopConsoleOpen(false);
+  }, [clearConsoleCloseTimer]);
+
+  const scheduleDesktopConsoleClose = useCallback(() => {
+    clearConsoleCloseTimer();
+    consoleCloseTimerRef.current = window.setTimeout(() => {
+      setDesktopConsoleOpen(false);
+      consoleCloseTimerRef.current = null;
+    }, 25);
+  }, [clearConsoleCloseTimer]);
+
+  useEffect(() => () => clearConsoleCloseTimer(), [clearConsoleCloseTimer]);
+
+  useEffect(() => () => {
+    if (taskRenderFrameRef.current !== null) {
+      window.cancelAnimationFrame(taskRenderFrameRef.current);
+      taskRenderFrameRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    const handleResize = () => {
+      if (window.matchMedia('(max-width: 1279px)').matches) {
+        setDesktopConsoleOpen(false);
+      }
+    };
+
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
 
   useEffect(() => {
     const raw = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
@@ -1642,12 +2066,24 @@ export default function ImageTranslator() {
   }, [batchCompletedAt, batchStartedAt]);
 
   useEffect(() => {
+    if (!globalError) return;
+
+    const tone = getGlobalMessageTone(globalError);
+    const timer = window.setTimeout(() => {
+      setGlobalError((current) => current === globalError ? null : current);
+    }, tone === 'error' ? 6500 : 2800);
+
+    return () => window.clearTimeout(timer);
+  }, [globalError]);
+
+  useEffect(() => {
     if (tasks.length > 0) {
       return;
     }
 
     setBatchStartedAt(null);
     setBatchCompletedAt(null);
+    setBatchRunState('idle');
     setImageQueueLimit(null);
     setSkippedDuplicateCount(0);
     setActiveHistoryTaskId(null);
@@ -1655,6 +2091,7 @@ export default function ImageTranslator() {
     setDraftProjectName('');
     setIsEditingProjectName(false);
     setHistoryLogs('');
+    setMobileConsoleOpen(false);
   }, [tasks.length]);
 
   useEffect(() => {
@@ -1666,11 +2103,37 @@ export default function ImageTranslator() {
   }, [selectedTaskIds]);
 
   useEffect(() => {
+    selectedHistoryTaskIdsRef.current = selectedHistoryTaskIds;
+  }, [selectedHistoryTaskIds]);
+
+  useEffect(() => {
+    if (selectedHistoryTaskIdsRef.current.size === 0) return;
+    setSelectedHistoryTaskIds((current) => {
+      const historyIds = new Set(historyTasks.map((task) => task.id));
+      const next = new Set([...current].filter((id) => historyIds.has(id)));
+      if (next.size === current.size && [...next].every((id) => current.has(id))) {
+        return current;
+      }
+      selectedHistoryTaskIdsRef.current = next;
+      return next;
+    });
+  }, [historyTasks]);
+
+  useEffect(() => {
     softDeletedTasksRef.current = softDeletedTasks;
   }, [softDeletedTasks]);
 
   useEffect(() => {
-    setSelectedTaskIds((current) => new Set([...current].filter((id) => tasks.some((task) => task.id === id))));
+    if (selectedTaskIdsRef.current.size === 0) return;
+    setSelectedTaskIds((current) => {
+      const taskIds = new Set(tasks.map((task) => task.id));
+      const next = new Set([...current].filter((id) => taskIds.has(id)));
+      if (next.size === current.size && [...next].every((id) => current.has(id))) {
+        return current;
+      }
+      selectedTaskIdsRef.current = next;
+      return next;
+    });
   }, [tasks]);
 
   useEffect(() => {
@@ -1685,22 +2148,173 @@ export default function ImageTranslator() {
   }, [taskMenu]);
 
   useEffect(() => {
+    if (!historyMenu) return;
+    const closeMenu = () => setHistoryMenu(null);
+    window.addEventListener('click', closeMenu);
+    window.addEventListener('scroll', closeMenu, true);
+    return () => {
+      window.removeEventListener('click', closeMenu);
+      window.removeEventListener('scroll', closeMenu, true);
+    };
+  }, [historyMenu]);
+
+  useEffect(() => {
+    const dialogElement =
+      confirmDialogRef.current ??
+      startConfirmDialogRef.current ??
+      returnHomeDialogRef.current ??
+      pendingUploadDialogRef.current;
+
+    if (!dialogElement) return;
+
+    const previouslyFocused = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    window.setTimeout(() => {
+      const focusTarget = dialogElement.querySelector<HTMLElement>(
+        'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      );
+      focusTarget?.focus();
+    }, 0);
+
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      trapFocusInDialog(event, dialogElement);
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        if (confirmDialog) closeConfirmDialog();
+        else if (startConfirm) setStartConfirm(null);
+        else if (returnHomeConfirm) setReturnHomeConfirm(null);
+        else if (pendingUpload) setPendingUpload(null);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      if (previouslyFocused?.isConnected) {
+        window.setTimeout(() => previouslyFocused.focus(), 0);
+      }
+    };
+  }, [closeConfirmDialog, confirmDialog, pendingUpload, returnHomeConfirm, startConfirm]);
+
+  useEffect(() => {
+    if (!historyOpen) return;
+
+    setDesktopConsoleOpen(false);
+    setMobileConsoleOpen(false);
+    const previouslyFocused = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    window.setTimeout(() => {
+      const focusTarget = historyDialogRef.current?.querySelector<HTMLElement>('button:not(:disabled)');
+      focusTarget?.focus();
+    }, 0);
+
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (historyDialogRef.current) {
+        trapFocusInDialog(event, historyDialogRef.current);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      if (previouslyFocused?.isConnected) {
+        window.setTimeout(() => previouslyFocused.focus(), 0);
+      }
+    };
+  }, [historyOpen]);
+
+  useEffect(() => {
+    if (!historyOpen) return;
+
+    const canvasElement = canvasRef.current;
+    const previousBodyOverflow = document.body.style.overflow;
+    const previousHtmlOverflow = document.documentElement.style.overflow;
+    const previousCanvasOverflow = canvasElement?.style.overflow;
+
+    document.body.style.overflow = 'hidden';
+    document.documentElement.style.overflow = 'hidden';
+    if (canvasElement) {
+      canvasElement.style.overflow = 'hidden';
+    }
+
+    return () => {
+      document.body.style.overflow = previousBodyOverflow;
+      document.documentElement.style.overflow = previousHtmlOverflow;
+      if (canvasElement && previousCanvasOverflow !== undefined) {
+        canvasElement.style.overflow = previousCanvasOverflow;
+      }
+    };
+  }, [historyOpen]);
+
+  useEffect(() => {
+    if (!settingsOpen && !confirmDialog && !startConfirm && !returnHomeConfirm && !pendingUpload) return;
+    setDesktopConsoleOpen(false);
+  }, [confirmDialog, pendingUpload, returnHomeConfirm, settingsOpen, startConfirm]);
+
+  useEffect(() => {
     const isEditableTarget = (target: EventTarget | null) => {
       const element = target instanceof HTMLElement ? target : null;
       return Boolean(element?.closest('input, textarea, select, [contenteditable="true"]'));
     };
 
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (settingsOpen || historyOpen || isEditableTarget(event.target)) return;
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (settingsOpen || confirmDialog || startConfirm || returnHomeConfirm || pendingUpload || isEditableTarget(event.target)) return;
+
+      if (event.key === 'Escape' && desktopConsoleOpen) {
+        event.preventDefault();
+        closeDesktopConsole();
+        return;
+      }
+
+      if (historyOpen) {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          hideSelectionOverlay();
+          if (historyMenu) setHistoryMenu(null);
+          else if (selectedHistoryTaskId) setSelectedHistoryTaskId(null);
+          else if (selectedHistoryTaskIdsRef.current.size > 0) {
+            selectedHistoryTaskIdsRef.current = new Set();
+            setSelectedHistoryTaskIds(selectedHistoryTaskIdsRef.current);
+          }
+          else setHistoryOpen(false);
+          return;
+        }
+        if (!selectedHistoryTaskId && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {
+          event.preventDefault();
+          selectedHistoryTaskIdsRef.current = new Set(historyTasks.map((task) => task.id));
+          setSelectedHistoryTaskIds(selectedHistoryTaskIdsRef.current);
+          return;
+        }
+        if (!selectedHistoryTaskId && (event.key === 'Delete' || event.key === 'Backspace')) {
+          const selectedIds = [...selectedHistoryTaskIdsRef.current];
+          if (selectedIds.length > 0) {
+            event.preventDefault();
+            requestDeleteHistoryTasks(selectedIds);
+          }
+          return;
+        }
+        if (!selectedHistoryTaskId && event.key.toLowerCase() === 'd') {
+          const selectedIds = [...selectedHistoryTaskIdsRef.current];
+          if (selectedIds.length > 0) {
+            event.preventDefault();
+            void downloadHistoryTasks(selectedIds);
+          }
+        }
+        return;
+      }
+
       if (event.key === 'Escape') {
         setTaskMenu(null);
-        setSelectionBox(null);
-        setSelectedTaskIds(new Set());
+        hideSelectionOverlay();
+        setSelectedTaskIdsIfChanged(new Set());
         return;
       }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {
         event.preventDefault();
-        setSelectedTaskIds(new Set(tasksRef.current.map((task) => task.id)));
+        setSelectedTaskIdsIfChanged(new Set(tasksRef.current.map((task) => task.id)));
         return;
       }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
@@ -1719,11 +2333,17 @@ export default function ImageTranslator() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [historyOpen, isProcessingBatch, settingsOpen]);
+  }, [closeDesktopConsole, confirmDialog, desktopConsoleOpen, historyMenu, historyOpen, historyTasks, isProcessingBatch, pendingUpload, returnHomeConfirm, selectedHistoryTaskId, settingsOpen, startConfirm]);
 
   const refreshHistory = async () => {
+    if (historyRefreshPromiseRef.current) {
+      historyRefreshAgainRef.current = true;
+      return historyRefreshPromiseRef.current;
+    }
+
+    const refreshPromise = (async () => {
     try {
-      const response = await fetch('/api/history');
+      const response = await fetch(`/api/history?preview=1&limit=${HISTORY_LIST_PAGE_SIZE}`);
       const parsed = await response.json();
       if (!response.ok) {
         throw new Error(parsed?.error?.message ?? '历史记录读取失败。');
@@ -1736,6 +2356,7 @@ export default function ImageTranslator() {
           if (!existing) return task;
           return {
             ...task,
+            previewImages: task.previewImages?.length ? task.previewImages : existing.previewImages,
             images: task.images.map((image) => {
               const existingImage = existing.images.find((item) => item.id === image.id);
               return existingImage?.originalDataUrl !== undefined || existingImage?.resultDataUrl !== undefined
@@ -1745,17 +2366,75 @@ export default function ImageTranslator() {
           };
         });
       });
-      setSelectedHistoryTaskId((current) => nextTasks.some((task: HistoryTaskRecord) => task.id === current) ? current : nextTasks[0]?.id ?? null);
+      setSelectedHistoryTaskId((current) => current && nextTasks.some((task: HistoryTaskRecord) => task.id === current) ? current : null);
       setResourceDir(parsed.resourceDir ?? '');
+      setHistoryListCursor(typeof parsed.nextCursor === 'number' ? parsed.nextCursor : null);
+      setHistoryHasMore(Boolean(parsed.hasMore));
+      setHistoryTotalCount(Number(parsed.totalCount ?? nextTasks.length));
       return nextTasks as HistoryTaskRecord[];
     } catch (error) {
       setGlobalError(getErrorMessage(error));
       return [] as HistoryTaskRecord[];
+    } finally {
+      historyRefreshPromiseRef.current = null;
+      if (historyRefreshAgainRef.current) {
+        historyRefreshAgainRef.current = false;
+        window.setTimeout(() => {
+          void refreshHistory();
+        }, 120);
+      }
     }
+    })();
+
+    historyRefreshPromiseRef.current = refreshPromise;
+    return refreshPromise;
+  };
+
+  const loadMoreHistoryTasks = async () => {
+    if (!historyHasMore || historyListCursor === null || historyLoading) return;
+    setHistoryLoading(true);
+    try {
+      const response = await fetch(`/api/history?preview=1&limit=${HISTORY_LIST_PAGE_SIZE}&cursor=${historyListCursor}`);
+      const parsed = await response.json();
+      if (!response.ok) throw new Error(parsed?.error?.message ?? '历史记录读取失败。');
+      const nextTasks = (parsed.tasks ?? []) as HistoryTaskRecord[];
+      setHistoryTasks((current) => {
+        const merged = new Map(current.map((task) => [task.id, task]));
+        nextTasks.forEach((task) => {
+          const existing = merged.get(task.id);
+          merged.set(task.id, existing ? { ...task, previewImages: task.previewImages?.length ? task.previewImages : existing.previewImages } : task);
+        });
+        return Array.from(merged.values()).sort((a, b) => b.updatedAt - a.updatedAt);
+      });
+      setHistoryListCursor(typeof parsed.nextCursor === 'number' ? parsed.nextCursor : null);
+      setHistoryHasMore(Boolean(parsed.hasMore));
+      setHistoryTotalCount(Number(parsed.totalCount ?? historyTotalCount));
+      setResourceDir(parsed.resourceDir ?? resourceDir);
+    } catch (error) {
+      setGlobalError(getErrorMessage(error));
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const scheduleHistoryRefresh = (delayMs = 900) => {
+    if (historyRefreshTimerRef.current !== null) {
+      window.clearTimeout(historyRefreshTimerRef.current);
+    }
+
+    historyRefreshTimerRef.current = window.setTimeout(() => {
+      historyRefreshTimerRef.current = null;
+      void refreshHistory();
+    }, delayMs);
   };
 
   useEffect(() => {
     void refreshHistory();
+    return () => {
+      if (historyRefreshTimerRef.current !== null) {
+        window.clearTimeout(historyRefreshTimerRef.current);
+      }
+    };
   }, []);
 
   const buildHistoryTaskPayload = (historyTaskId: string, allTasks: ImageTask[], nameOverride?: string) => ({
@@ -1823,7 +2502,7 @@ export default function ImageTranslator() {
       taskId: historyTaskId,
       imageId: historyImageId,
       patch: toHistoryImage(merged),
-    }).then(() => refreshHistory()).catch((error) => setGlobalError(getErrorMessage(error)));
+    }).then(() => scheduleHistoryRefresh()).catch((error) => setGlobalError(getErrorMessage(error)));
 
     if (resultDataUrl) {
       void postHistory('save-image', {
@@ -1832,7 +2511,7 @@ export default function ImageTranslator() {
         kind: 'result',
         relativePath: merged.outputRelativePath,
         dataUrl: resultDataUrl,
-      }).then(() => refreshHistory()).catch((error) => setGlobalError(getErrorMessage(error)));
+      }).then(() => scheduleHistoryRefresh()).catch((error) => setGlobalError(getErrorMessage(error)));
     }
   };
 
@@ -1896,7 +2575,7 @@ export default function ImageTranslator() {
       }
       tasksRef.current = [];
       setTasks([]);
-      setSelectedTaskIds(new Set());
+      setSelectedTaskIdsIfChanged(new Set());
       setUndoStack([]);
       setSoftDeletedTasks((current) => current.filter((record) => (record.task.historyTaskId ?? activeHistoryTaskId) !== activeHistoryTaskId));
       setActiveHistoryTaskId(null);
@@ -1910,17 +2589,38 @@ export default function ImageTranslator() {
     }
   };
 
+  const loadHistoryTaskDetail = async (
+    historyTaskId: string,
+    options: { offset?: number; append?: boolean; limit?: number } = {},
+  ) => {
+    const offset = options.offset ?? 0;
+    const limit = options.limit ?? HISTORY_DETAIL_PAGE_SIZE;
+    const response = await fetch(
+      `/api/history?taskId=${encodeURIComponent(historyTaskId)}&includeData=1&imageOffset=${offset}&imageLimit=${limit}`,
+    );
+    const parsed = await response.json();
+    if (!response.ok) throw new Error(parsed?.error?.message ?? '历史任务读取失败。');
+    const detailTask = parsed.task as HistoryTaskRecord;
+    setSelectedHistoryLogs(parsed.logs ?? '');
+    setHistoryDetailTaskIds((current) => new Set(current).add(detailTask.id));
+    setHistoryDetailHasMore(Boolean(parsed.hasMoreImages ?? detailTask.hasMoreImages));
+    setHistoryTasks((current) => {
+      const existing = current.find((task) => task.id === detailTask.id);
+      const mergedTask = mergeHistoryTaskImages(existing, detailTask, Boolean(options.append));
+      return [mergedTask, ...current.filter((task) => task.id !== detailTask.id)].sort((a, b) => b.updatedAt - a.updatedAt);
+    });
+    return detailTask;
+  };
+
   const selectHistoryTask = async (historyTaskId: string) => {
+    selectedHistoryTaskIdsRef.current = new Set();
+    setSelectedHistoryTaskIds(selectedHistoryTaskIdsRef.current);
+    setHistoryMenu(null);
     setSelectedHistoryTaskId(historyTaskId);
+    setHistoryDetailHasMore(false);
     setHistoryLoading(true);
     try {
-      const response = await fetch(`/api/history?taskId=${encodeURIComponent(historyTaskId)}&includeData=1`);
-      const parsed = await response.json();
-      if (!response.ok) throw new Error(parsed?.error?.message ?? '历史任务读取失败。');
-      const detailTask = parsed.task as HistoryTaskRecord;
-      setSelectedHistoryLogs(parsed.logs ?? '');
-      setHistoryDetailTaskIds((current) => new Set(current).add(detailTask.id));
-      setHistoryTasks((current) => [detailTask, ...current.filter((task) => task.id !== detailTask.id)].sort((a, b) => b.updatedAt - a.updatedAt));
+      await loadHistoryTaskDetail(historyTaskId);
     } catch (error) {
       setGlobalError(getErrorMessage(error));
     } finally {
@@ -1928,25 +2628,63 @@ export default function ImageTranslator() {
     }
   };
 
+  const loadMoreHistoryTaskImages = async () => {
+    const task = selectedHistoryTaskId
+      ? historyTasks.find((item) => item.id === selectedHistoryTaskId)
+      : null;
+    if (!task || !historyDetailHasMore || historyDetailLoadingMore) return;
+    setHistoryDetailLoadingMore(true);
+    try {
+      await loadHistoryTaskDetail(task.id, {
+        offset: task.images.length,
+        append: true,
+      });
+    } catch (error) {
+      setGlobalError(getErrorMessage(error));
+    } finally {
+      setHistoryDetailLoadingMore(false);
+    }
+  };
+
+  const fetchFullHistoryTaskWithData = async (historyTaskId: string) => {
+    let offset = 0;
+    let mergedTask: HistoryTaskRecord | null = null;
+    let logs = '';
+
+    while (true) {
+      const response = await fetch(
+        `/api/history?taskId=${encodeURIComponent(historyTaskId)}&includeData=1&imageOffset=${offset}&imageLimit=${HISTORY_DETAIL_PAGE_SIZE}`,
+      );
+      const parsed = await response.json();
+      if (!response.ok) throw new Error(parsed?.error?.message ?? '历史任务读取失败。');
+      const pageTask = parsed.task as HistoryTaskRecord;
+      logs = parsed.logs ?? logs;
+      mergedTask = mergeHistoryTaskImages(mergedTask ?? undefined, pageTask, Boolean(mergedTask));
+
+      if (!parsed.hasMoreImages) break;
+      offset = Number(parsed.nextImageOffset ?? (offset + HISTORY_DETAIL_PAGE_SIZE));
+    }
+
+    if (!mergedTask) throw new Error('历史任务读取失败。');
+    return { task: mergedTask, logs };
+  };
+
   const openHistoryPanel = async () => {
     setHistoryOpen(true);
+    setSelectedHistoryTaskId(null);
+    setHistoryDetailHasMore(false);
+    selectedHistoryTaskIdsRef.current = new Set();
+    setSelectedHistoryTaskIds(selectedHistoryTaskIdsRef.current);
+    setSelectedHistoryLogs('');
     setHistoryLoading(true);
     try {
-      const nextTasks = await refreshHistory();
-      const nextSelectedId = selectedHistoryTaskId && nextTasks.some((task) => task.id === selectedHistoryTaskId)
-        ? selectedHistoryTaskId
-        : nextTasks[0]?.id;
-      if (nextSelectedId) {
-        await selectHistoryTask(nextSelectedId);
-      } else {
-        setSelectedHistoryLogs('');
-      }
+      await refreshHistory();
     } finally {
       setHistoryLoading(false);
     }
   };
 
-  const deleteHistoryTask = async (historyTaskId: string) => {
+  const performDeleteHistoryTask = async (historyTaskId: string) => {
     setHistoryLoading(true);
     try {
       const deletedIndex = historyTasks.findIndex((task) => task.id === historyTaskId);
@@ -1961,14 +2699,118 @@ export default function ImageTranslator() {
         setHistoryLogs('');
       }
 
-      if (nextSelectedTask) {
+      setSelectedHistoryTaskId(null);
+      setSelectedHistoryLogs('');
+      if (!nextSelectedTask) {
+        setHistoryDetailTaskIds(new Set());
+      } else if (selectedHistoryTaskId === historyTaskId) {
         setSelectedHistoryTaskId(nextSelectedTask.id);
-        await selectHistoryTask(nextSelectedTask.id);
-      } else {
+        await loadHistoryTaskDetail(nextSelectedTask.id);
+      }
+      setGlobalError('已删除 1 个历史项目。');
+    } catch (error) {
+      setGlobalError(getErrorMessage(error));
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const requestDeleteHistoryTask = (historyTaskId: string) => {
+    const task = historyTasks.find((item) => item.id === historyTaskId);
+    openConfirmDialog({
+      title: '删除这个历史项目？',
+      message: `将彻底删除「${task?.name ?? historyTaskId}」的本地记录和已保存图片。这个操作不能撤销。`,
+      confirmLabel: '确认删除',
+      tone: 'danger',
+      onConfirm: () => performDeleteHistoryTask(historyTaskId),
+    });
+  };
+
+  const performDeleteHistoryTasks = async (historyTaskIds: string[]) => {
+    const uniqueIds = [...new Set(historyTaskIds)].filter(Boolean);
+    if (uniqueIds.length === 0 || historyLoading) return;
+    setHistoryMenu(null);
+    setHistoryLoading(true);
+    try {
+      const deletedIndex = historyTasks.findIndex((task) => uniqueIds.includes(task.id));
+      const nextTasks = historyTasks.filter((task) => !uniqueIds.includes(task.id));
+      const nextSelectedTask = nextTasks[Math.max(0, Math.min(deletedIndex, nextTasks.length - 1))] ?? nextTasks[0];
+      for (const taskId of uniqueIds) {
+        await postHistory('delete-task', { taskId });
+      }
+      setHistoryTasks(nextTasks);
+      selectedHistoryTaskIdsRef.current = new Set();
+      setSelectedHistoryTaskIds(selectedHistoryTaskIdsRef.current);
+      if (selectedHistoryTaskId && uniqueIds.includes(selectedHistoryTaskId)) {
         setSelectedHistoryTaskId(null);
         setSelectedHistoryLogs('');
-        setHistoryDetailTaskIds(new Set());
+        if (nextSelectedTask) {
+          setSelectedHistoryTaskId(nextSelectedTask.id);
+          await loadHistoryTaskDetail(nextSelectedTask.id);
+        } else {
+          setHistoryDetailTaskIds(new Set());
+        }
       }
+      if (activeHistoryTaskId && uniqueIds.includes(activeHistoryTaskId)) {
+        setActiveHistoryTaskId(null);
+        setHistoryLogs('');
+      }
+      setGlobalError(`已删除 ${uniqueIds.length} 个历史项目。`);
+      scheduleHistoryRefresh(120);
+    } catch (error) {
+      setGlobalError(getErrorMessage(error));
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const requestDeleteHistoryTasks = (historyTaskIds: string[]) => {
+    const uniqueIds = [...new Set(historyTaskIds)].filter(Boolean);
+    if (uniqueIds.length === 0 || historyLoading) return;
+    openConfirmDialog({
+      title: uniqueIds.length === 1 ? '删除这个历史项目？' : `删除 ${uniqueIds.length} 个历史项目？`,
+      message: uniqueIds.length === 1
+        ? `将彻底删除「${historyTasks.find((task) => task.id === uniqueIds[0])?.name ?? uniqueIds[0]}」的本地记录和已保存图片。这个操作不能撤销。`
+        : `将彻底删除选中的 ${uniqueIds.length} 个历史项目及其本地图片。这个操作不能撤销。`,
+      confirmLabel: uniqueIds.length === 1 ? '确认删除' : '全部删除',
+      tone: 'danger',
+      onConfirm: () => performDeleteHistoryTasks(uniqueIds),
+    });
+  };
+
+  const downloadHistoryTasks = async (historyTaskIds: string[]) => {
+    const uniqueIds = [...new Set(historyTaskIds)].filter(Boolean);
+    if (uniqueIds.length === 0 || historyLoading) return;
+    setHistoryMenu(null);
+    setHistoryLoading(true);
+    try {
+      const zip = new JSZip();
+      const usedPaths = new Set<string>();
+      for (const taskId of uniqueIds) {
+        const { task, logs } = await fetchFullHistoryTaskWithData(taskId);
+        const safeRoot = sanitizePathSegment(task.name || task.id);
+        task.images.forEach((image) => {
+          if (image.originalDataUrl) {
+            zip.file(buildUniqueRelativePath(`${safeRoot}/originals/${image.relativePath.split('/').at(-1) ?? image.name}`, usedPaths), dataUrlToBlob(image.originalDataUrl));
+          }
+          if (image.resultDataUrl) {
+            zip.file(buildUniqueRelativePath(`${safeRoot}/results/${image.outputRelativePath.split('/').at(-1) ?? image.name}`, usedPaths), dataUrlToBlob(image.resultDataUrl));
+          }
+        });
+        if (logs) {
+          zip.file(buildUniqueRelativePath(`${safeRoot}/logs.ndjson`, usedPaths), logs);
+        }
+      }
+      const content = await zip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(content);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `${uniqueIds.length === 1 ? 'history_project' : 'history_projects'}_${Date.now()}.zip`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      URL.revokeObjectURL(url);
+      setGlobalError(`已打包 ${uniqueIds.length} 个历史项目。`);
     } catch (error) {
       setGlobalError(getErrorMessage(error));
     } finally {
@@ -1977,13 +2819,10 @@ export default function ImageTranslator() {
   };
 
   const restoreHistoryTask = async (historyTaskId: string) => {
-    setHistoryLoading(true);
+      setHistoryLoading(true);
     try {
       await flushCurrentWorkspaceToHistory();
-      const response = await fetch(`/api/history?taskId=${encodeURIComponent(historyTaskId)}&includeData=1`);
-      const parsed = await response.json();
-      if (!response.ok) throw new Error(parsed?.error?.message ?? '历史任务恢复失败。');
-      const historyTask = parsed.task as HistoryTaskRecord;
+      const { task: historyTask, logs } = await fetchFullHistoryTaskWithData(historyTaskId);
       const restoredTasks = await Promise.all(
         historyTask.images.map(async (image) => {
           if (!image.originalDataUrl) throw new Error(`缺少原图：${image.relativePath}`);
@@ -2025,8 +2864,8 @@ export default function ImageTranslator() {
       setActiveProjectName(historyTask.name);
       setDraftProjectName(historyTask.name);
       setSelectedHistoryTaskId(historyTask.id);
-      setHistoryLogs(parsed.logs ?? '');
-      setSelectedHistoryLogs(parsed.logs ?? '');
+      setHistoryLogs(logs);
+      setSelectedHistoryLogs(logs);
       setHistoryOpen(false);
       setGlobalError(null);
       window.setTimeout(() => workbenchRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0);
@@ -2063,7 +2902,11 @@ export default function ImageTranslator() {
       firstInput?.focus();
     }, 0);
 
-    const handleKeyDown = (event: KeyboardEvent) => {
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (settingsDialogRef.current) {
+        trapFocusInDialog(event, settingsDialogRef.current);
+      }
+
       if (event.key === 'Escape') {
         closeSettings();
       }
@@ -2133,6 +2976,7 @@ export default function ImageTranslator() {
       if (shouldCreateNewProject) {
         setBatchStartedAt(null);
         setBatchCompletedAt(null);
+        setBatchRunState('idle');
         setImageQueueLimit(null);
         setSkippedDuplicateCount(0);
         setHistoryLogs('');
@@ -2270,7 +3114,7 @@ export default function ImageTranslator() {
         : task,
     );
     tasksRef.current = nextTasks;
-    setTasks(nextTasks);
+    scheduleTasksRender();
   };
 
   const requestUpload = (files: FileList | File[], sourceKind: 'file' | 'folder') => {
@@ -2322,12 +3166,22 @@ export default function ImageTranslator() {
     }
   };
 
+  const setSelectedTaskIdsIfChanged = useCallback((nextIds: Set<string>) => {
+    const currentIds = selectedTaskIdsRef.current;
+    if (currentIds.size === nextIds.size && [...nextIds].every((id) => currentIds.has(id))) {
+      return;
+    }
+
+    selectedTaskIdsRef.current = nextIds;
+    setSelectedTaskIds(nextIds);
+  }, []);
+
   const getTasksByIds = (taskIds: string[]) => {
     const idSet = new Set(taskIds);
     return tasksRef.current.filter((task) => idSet.has(task.id));
   };
 
-  const softRemoveTasks = (taskIds: string[]) => {
+  const softRemoveTasks = useCallback((taskIds: string[]) => {
     if (isProcessingBatch) return;
     const idSet = new Set(taskIds);
     const removedRecords = tasksRef.current
@@ -2338,13 +3192,13 @@ export default function ImageTranslator() {
 
     const nextTasks = tasksRef.current.filter((task) => !idSet.has(task.id));
     tasksRef.current = nextTasks;
-    setTasks(nextTasks);
+    scheduleTasksRender();
     setTaskMenu(null);
-    setSelectedTaskIds(new Set());
+    setSelectedTaskIdsIfChanged(new Set());
     setUndoStack((current) => [...current, removedRecords].slice(-20));
     setSoftDeletedTasks((current) => [...current, ...removedRecords]);
     setGlobalError(`已从当前工作台移除 ${removedRecords.length} 张图片。按 Ctrl+Z 可撤销；归档开启新项目时才会彻底清理。`);
-  };
+  }, [isProcessingBatch, scheduleTasksRender, setSelectedTaskIdsIfChanged]);
 
   const undoLastSoftDelete = () => {
     setUndoStack((current) => {
@@ -2359,10 +3213,10 @@ export default function ImageTranslator() {
         .sort((a, b) => a.index - b.index)
         .forEach((record) => {
           nextTasks.splice(Math.min(record.index, nextTasks.length), 0, record.task);
-        });
+      });
       tasksRef.current = nextTasks;
-      setTasks(nextTasks);
-      setSelectedTaskIds(new Set(restoredRecords.map((record) => record.task.id)));
+      scheduleTasksRender();
+      setSelectedTaskIdsIfChanged(new Set(restoredRecords.map((record) => record.task.id)));
       setSoftDeletedTasks((deleted) => {
         const restoredIds = new Set(restoredRecords.map((record) => record.task.id));
         return deleted.filter((record) => !restoredIds.has(record.task.id));
@@ -2372,9 +3226,9 @@ export default function ImageTranslator() {
     });
   };
 
-  const removeTask = (id: string) => {
+  const removeTask = useCallback((id: string) => {
     softRemoveTasks([id]);
-  };
+  }, [softRemoveTasks]);
 
   const removeSelectedTasks = () => {
     const taskIds = [...selectedTaskIdsRef.current];
@@ -2402,15 +3256,42 @@ export default function ImageTranslator() {
         : task,
     );
     tasksRef.current = nextTasks;
-    setTasks(nextTasks);
+    scheduleTasksRender();
+    setBatchRunState('paused');
+    setBatchCompletedAt(null);
+    nextTasks
+      .filter((task) => pausableIds.includes(task.id))
+      .forEach((task) => {
+        persistTaskProgress(task, {
+          status: 'paused',
+          error: undefined,
+          completedAt: undefined,
+        });
+      });
     setTaskMenu(null);
     setGlobalError(`已暂停 ${pausableIds.length} 张图片，点继续可接着处理。`);
   };
 
-  const pauseSelectedTasks = () => {
+  const runOrPauseSelectedTasks = () => {
     const taskIds = [...selectedTaskIdsRef.current];
     if (taskIds.length === 0) return;
-    pauseTasks(taskIds);
+    const taskIdSet = new Set(taskIds);
+    const pausedIds = tasksRef.current
+      .filter((task) => taskIdSet.has(task.id) && task.status === 'paused')
+      .map((task) => task.id);
+    const pausableIds = tasksRef.current
+      .filter((task) => taskIdSet.has(task.id) && !['success', 'copied', 'paused'].includes(task.status))
+      .map((task) => task.id);
+
+    if (pausableIds.length > 0) {
+      pauseTasks(taskIds);
+      return;
+    }
+
+    if (pausedIds.length > 0) {
+      confirmAndProcessBatch(pausedIds);
+      return;
+    }
   };
 
   const pauseAllTasks = () => {
@@ -2420,13 +3301,20 @@ export default function ImageTranslator() {
     pauseTasks(taskIds);
   };
 
-  const openTaskMenu = (event: MouseEvent, taskId: string) => {
+  const openTaskMenu = useCallback((event: MouseEvent, taskId: string) => {
     event.preventDefault();
+    event.stopPropagation();
     const selectedIds = selectedTaskIdsRef.current;
     const taskIds = selectedIds.has(taskId) && selectedIds.size > 0 ? [...selectedIds] : [taskId];
-    setSelectedTaskIds(new Set(taskIds));
+    setSelectedTaskIdsIfChanged(new Set(taskIds));
     setTaskMenu({ taskIds, x: event.clientX, y: event.clientY });
-  };
+  }, [setSelectedTaskIdsIfChanged]);
+
+  const openTaskKeyboardMenu = useCallback((taskId: string, element: HTMLElement) => {
+    const rect = element.getBoundingClientRect();
+    setSelectedTaskIdsIfChanged(new Set([taskId]));
+    setTaskMenu({ taskIds: [taskId], x: rect.left + 24, y: rect.top + 24 });
+  }, [setSelectedTaskIdsIfChanged]);
 
   const reprocessTasks = (taskIds: string[], mode: 'translate' | 'redraw') => {
     setTaskMenu(null);
@@ -2455,7 +3343,7 @@ export default function ImageTranslator() {
     }
 
     tasksRef.current = nextTasks;
-    setTasks(nextTasks);
+    scheduleTasksRender();
     void postHistory('append-log', {
       taskId: nextTasks.find((task) => runnableIds.includes(task.id))?.historyTaskId ?? activeHistoryTaskId ?? '',
       event: { type: mode === 'translate' ? 'batch-retranslate' : 'batch-redraw', imageIds: runnableIds },
@@ -2523,7 +3411,7 @@ export default function ImageTranslator() {
     downloadDataUrl(dataUrl, fileName);
   };
 
-  const deleteHistoryImage = async (image: HistoryImageRecord) => {
+  const performDeleteHistoryImage = async (image: HistoryImageRecord) => {
     if (!selectedHistoryTask) return;
     setHistoryLoading(true);
     try {
@@ -2538,6 +3426,17 @@ export default function ImageTranslator() {
     } finally {
       setHistoryLoading(false);
     }
+  };
+
+  const requestDeleteHistoryImage = (image: HistoryImageRecord) => {
+    if (!selectedHistoryTask) return;
+    openConfirmDialog({
+      title: '删除这张历史图片？',
+      message: `将从「${selectedHistoryTask.name}」里彻底删除「${image.name}」的原图和结果图。这个操作不能撤销。`,
+      confirmLabel: '删除这张',
+      tone: 'danger',
+      onConfirm: () => performDeleteHistoryImage(image),
+    });
   };
 
   const restoreHistoryImageForReprocess = async (image: HistoryImageRecord, mode: 'translate' | 'redraw') => {
@@ -2716,6 +3615,7 @@ export default function ImageTranslator() {
     }
 
     setIsProcessingBatch(true);
+    setBatchRunState('running');
     setGlobalError(null);
     const batchRunStartedAt =
       batchStartedAt &&
@@ -2775,8 +3675,13 @@ export default function ImageTranslator() {
           activeTaskControllersRef.current.set(task.id, taskController);
           let attemptCount = task.attemptCount ?? 0;
           let retryCount = task.retryCount ?? 0;
+          let pauseGuardActive = task.status !== 'paused';
 
           const applyTaskUpdate = (updates: Partial<ImageTask>) => {
+            if (updates.status && updates.status !== 'paused') {
+              pauseGuardActive = true;
+            }
+
             const nextUpdates = {
               attemptCount,
               retryCount,
@@ -2792,7 +3697,11 @@ export default function ImageTranslator() {
           };
 
           const throwIfPaused = () => {
-            if (taskController.signal.aborted || tasksRef.current.find((item) => item.id === task.id)?.status === 'paused') {
+            const taskPausedAfterResume =
+              pauseGuardActive &&
+              tasksRef.current.find((item) => item.id === task.id)?.status === 'paused';
+
+            if (taskController.signal.aborted || taskPausedAfterResume) {
               throw new ProcessingError('已暂停。', {
                 kind: 'paused',
                 retryable: false,
@@ -3282,6 +4191,7 @@ export default function ImageTranslator() {
                       watermarkText: currentWatermarkText,
                       outputAspectRatio: currentOutputAspectRatio,
                     }),
+                    signal: taskController.signal,
                   }),
                 ),
               onTransientFailure: registerImageFailure,
@@ -3324,8 +4234,14 @@ export default function ImageTranslator() {
       );
     } finally {
       setIsProcessingBatch(false);
-      setBatchCompletedAt(Date.now());
-      setNowTimestamp(Date.now());
+      const finishedAt = Date.now();
+      const hasPausedTasks = tasksRef.current.some((task) => task.status === 'paused');
+      setBatchRunState(hasPausedTasks ? 'paused' : 'completed');
+      if (!hasPausedTasks) {
+        setBatchCompletedAt(finishedAt);
+      }
+      setNowTimestamp(finishedAt);
+      scheduleHistoryRefresh(120);
     }
   };
 
@@ -3336,12 +4252,18 @@ export default function ImageTranslator() {
     if (count === 0) return;
     const pausedInScope = scopeTasks.filter((task) => task.status === 'paused').length;
     const startableInScope = scopeTasks.filter((task) => task.status === 'idle' || task.status === 'error').length;
+
+    if (pausedInScope > 0 && startableInScope === 0) {
+      void processBatch(onlyTaskIds);
+      return;
+    }
+
     setStartConfirm({
       taskIds: onlyTaskIds,
       count,
       language: targetLanguage,
       ratio: outputAspectRatio,
-      mode: pausedInScope > 0 && startableInScope === 0 ? 'continue' : 'start',
+      mode: 'start',
     });
   };
 
@@ -3378,12 +4300,12 @@ export default function ImageTranslator() {
     if (isProcessingBatch) pauseAllTasks();
     tasksRef.current = [];
     setTasks([]);
-    setSelectedTaskIds(new Set());
+    setSelectedTaskIdsIfChanged(new Set());
     setTaskMenu(null);
     setPendingUpload(null);
     setStartConfirm(null);
     setReturnHomeConfirm(null);
-    setSelectionBox(null);
+    hideSelectionOverlay();
     setActiveHistoryTaskId(null);
     setActiveProjectName('');
     setDraftProjectName('');
@@ -3479,7 +4401,7 @@ export default function ImageTranslator() {
     }
   };
 
-  const handleDownloadSingle = (task: ImageTask) => {
+  const handleDownloadSingle = useCallback((task: ImageTask) => {
     if (!task.generatedUrl) {
       return;
     }
@@ -3495,9 +4417,13 @@ export default function ImageTranslator() {
     anchor.click();
     document.body.removeChild(anchor);
     URL.revokeObjectURL(url);
-  };
+  }, []);
 
-  const toggleTaskSelection = (taskId: string, event: MouseEvent<HTMLElement>) => {
+  const selectOutputAspectRatio = useCallback((ratio: OutputAspectRatio) => {
+    setOutputAspectRatio((current) => current === ratio ? current : ratio);
+  }, []);
+
+  const toggleTaskSelection = useCallback((taskId: string, event: MouseEvent<HTMLElement>) => {
     event.stopPropagation();
     if (selectionSuppressClickRef.current) {
       event.preventDefault();
@@ -3509,37 +4435,108 @@ export default function ImageTranslator() {
         const next = new Set(current);
         if (next.has(taskId)) next.delete(taskId);
         else next.add(taskId);
+        selectedTaskIdsRef.current = next;
         return next;
       }
-      return new Set([taskId]);
-    });
-  };
-
-  const clearTaskSelection = () => {
-    setSelectedTaskIds(new Set());
-    setTaskMenu(null);
-  };
-
-  const selectTasksInBox = (box: { left: number; right: number; top: number; bottom: number }, additive: boolean) => {
-    const nextIds = new Set(additive ? selectedTaskIdsRef.current : []);
-    canvasRef.current?.querySelectorAll<HTMLElement>('[data-task-id]').forEach((element) => {
-      const rect = element.getBoundingClientRect();
-      const intersects = rect.left <= box.right && rect.right >= box.left && rect.top <= box.bottom && rect.bottom >= box.top;
-      if (intersects) {
-        const taskId = element.dataset.taskId;
-        if (taskId) nextIds.add(taskId);
+      if (current.size === 1 && current.has(taskId)) {
+        return current;
       }
+      const next = new Set([taskId]);
+      selectedTaskIdsRef.current = next;
+      return next;
     });
-    setSelectedTaskIds(nextIds);
+  }, []);
+
+  const clearTaskSelection = useCallback(() => {
+    setSelectedTaskIdsIfChanged(new Set());
+    setTaskMenu(null);
+  }, [setSelectedTaskIdsIfChanged]);
+
+  const updateSelectionOverlay = (startX: number, startY: number, currentX: number, currentY: number) => {
+    const overlay = selectionOverlayRef.current;
+    if (!overlay) return;
+    overlay.style.display = 'block';
+    overlay.style.left = `${Math.min(startX, currentX)}px`;
+    overlay.style.top = `${Math.min(startY, currentY)}px`;
+    overlay.style.width = `${Math.abs(currentX - startX)}px`;
+    overlay.style.height = `${Math.abs(currentY - startY)}px`;
+  };
+
+  const hideSelectionOverlay = () => {
+    const overlay = selectionOverlayRef.current;
+    if (!overlay) return;
+    overlay.style.display = 'none';
+    overlay.style.width = '0px';
+    overlay.style.height = '0px';
+  };
+
+  const cacheTaskSelectionRects = () => {
+    const rects: SelectionRect[] = [];
+    const elementMap = new Map<string, HTMLElement>();
+    canvasRef.current?.querySelectorAll<HTMLElement>('[data-task-id]').forEach((element) => {
+      const taskId = element.dataset.taskId;
+      if (!taskId) return;
+      const rect = element.getBoundingClientRect();
+      rects.push({
+        id: taskId,
+        left: rect.left,
+        right: rect.right,
+        top: rect.top,
+        bottom: rect.bottom,
+        element,
+      });
+      elementMap.set(taskId, element);
+    });
+    taskSelectionRectsRef.current = rects.sort((rectA, rectB) => rectA.top - rectB.top || rectA.left - rectB.left);
+    taskSelectionElementMapRef.current = elementMap;
+  };
+
+  const toggleTaskSelectionPreviewClass = (taskId: string, selected: boolean) => {
+    const element = taskSelectionElementMapRef.current.get(taskId);
+    if (!element) return;
+    element.classList.toggle('ui-task-card-selected', selected);
+    element.setAttribute('aria-pressed', selected ? 'true' : 'false');
+  };
+
+  const applyTaskSelectionPreview = (nextIds: Set<string>) => {
+    const currentIds = taskSelectionLiveIdsRef.current ?? selectedTaskIdsRef.current;
+    if (currentIds.size === nextIds.size && [...nextIds].every((id) => currentIds.has(id))) {
+      return;
+    }
+
+    currentIds.forEach((id) => {
+      if (!nextIds.has(id)) toggleTaskSelectionPreviewClass(id, false);
+    });
+    nextIds.forEach((id) => {
+      if (!currentIds.has(id)) toggleTaskSelectionPreviewClass(id, true);
+    });
+    taskSelectionLiveIdsRef.current = nextIds;
+  };
+
+  const selectTasksInBox = (box: SelectionBounds) => {
+    const nextIds = new Set(taskSelectionBaseIdsRef.current);
+    for (const rect of taskSelectionRectsRef.current) {
+      if (rect.bottom < box.top) continue;
+      if (rect.top > box.bottom) break;
+      const intersects = rect.left <= box.right && rect.right >= box.left && rect.top <= box.bottom && rect.bottom >= box.top;
+      if (intersects) nextIds.add(rect.id);
+    }
+    applyTaskSelectionPreview(nextIds);
   };
 
   const beginCanvasSelection = (event: MouseEvent<HTMLElement>) => {
     if (event.button !== 0) return;
     const target = event.target as HTMLElement;
     if (target.closest('button,input,textarea,select,a')) return;
+    if (target.closest('[data-task-card]')) return;
 
     event.preventDefault();
     const additive = event.ctrlKey || event.metaKey || event.shiftKey;
+    if (!additive && selectedTaskIdsRef.current.size > 0) {
+      clearTaskSelection();
+    }
+    taskSelectionBaseIdsRef.current = new Set(additive ? selectedTaskIdsRef.current : []);
+    cacheTaskSelectionRects();
     selectionDragRef.current = {
       startX: event.clientX,
       startY: event.clientY,
@@ -3549,21 +4546,35 @@ export default function ImageTranslator() {
 
     const makeBox = (clientX: number, clientY: number) => {
       const drag = selectionDragRef.current;
+      const rootRect = canvasRef.current?.getBoundingClientRect();
+      if (!drag || !rootRect) return null;
       return drag ? {
-        left: Math.min(drag.startX, clientX),
-        right: Math.max(drag.startX, clientX),
-        top: Math.min(drag.startY, clientY),
-        bottom: Math.max(drag.startY, clientY),
+        left: Math.max(Math.min(drag.startX, clientX), rootRect.left),
+        right: Math.min(Math.max(drag.startX, clientX), rootRect.right),
+        top: Math.max(Math.min(drag.startY, clientY), rootRect.top),
+        bottom: Math.min(Math.max(drag.startY, clientY), rootRect.bottom),
       } : null;
     };
 
     const finishSelection = (wasDragging: boolean) => {
+      const finalIds = taskSelectionLiveIdsRef.current;
       selectionDragRef.current = null;
+      taskSelectionPointRef.current = null;
+      taskSelectionLiveIdsRef.current = null;
+      taskSelectionRectsRef.current = [];
+      taskSelectionElementMapRef.current = new Map();
+      if (taskSelectionFrameRef.current !== null) {
+        window.cancelAnimationFrame(taskSelectionFrameRef.current);
+        taskSelectionFrameRef.current = null;
+      }
       document.body.classList.remove('ui-is-box-selecting');
-      setSelectionBox(null);
+      hideSelectionOverlay();
       window.removeEventListener('mousemove', handleMouseMove);
       window.removeEventListener('mouseup', handleMouseUp);
       if (wasDragging) {
+        if (finalIds) {
+          setSelectedTaskIdsIfChanged(finalIds);
+        }
         selectionSuppressClickRef.current = true;
         window.setTimeout(() => {
           selectionSuppressClickRef.current = false;
@@ -3571,27 +4582,41 @@ export default function ImageTranslator() {
       }
     };
 
-    const handleMouseMove = (moveEvent: globalThis.MouseEvent) => {
+    const runSelectionFrame = () => {
+      taskSelectionFrameRef.current = null;
       const drag = selectionDragRef.current;
-      if (!drag) return;
-      const distance = Math.hypot(moveEvent.clientX - drag.startX, moveEvent.clientY - drag.startY);
+      const point = taskSelectionPointRef.current;
+      if (!drag || !point) return;
+
+      const distance = Math.hypot(point.clientX - drag.startX, point.clientY - drag.startY);
       if (!drag.isSelecting && distance < 5) return;
 
       if (!drag.isSelecting) {
         drag.isSelecting = true;
         setTaskMenu(null);
-        if (!drag.additive) setSelectedTaskIds(new Set());
+        if (!drag.additive) applyTaskSelectionPreview(new Set());
         document.body.classList.add('ui-is-box-selecting');
       }
 
-      setSelectionBox({
-        startX: drag.startX,
-        startY: drag.startY,
-        currentX: moveEvent.clientX,
-        currentY: moveEvent.clientY,
-      });
-      const box = makeBox(moveEvent.clientX, moveEvent.clientY);
-      if (box) selectTasksInBox(box, drag.additive);
+      updateSelectionOverlay(drag.startX, drag.startY, point.clientX, point.clientY);
+      const box = makeBox(point.clientX, point.clientY);
+      if (box) selectTasksInBox(box);
+    };
+
+    const scheduleSelectionFrame = () => {
+      if (taskSelectionFrameRef.current !== null) return;
+      taskSelectionFrameRef.current = window.requestAnimationFrame(runSelectionFrame);
+    };
+
+    const handleMouseMove = (moveEvent: globalThis.MouseEvent) => {
+      const drag = selectionDragRef.current;
+      if (!drag) return;
+      taskSelectionPointRef.current = {
+        clientX: moveEvent.clientX,
+        clientY: moveEvent.clientY,
+      };
+      moveEvent.preventDefault();
+      scheduleSelectionFrame();
     };
 
     const handleMouseUp = (upEvent: globalThis.MouseEvent) => {
@@ -3599,12 +4624,213 @@ export default function ImageTranslator() {
       if (!drag) return;
       const wasDragging = drag.isSelecting;
       const box = makeBox(upEvent.clientX, upEvent.clientY);
-      if (wasDragging && box) selectTasksInBox(box, drag.additive);
+      if (wasDragging && box) selectTasksInBox(box);
       finishSelection(wasDragging);
     };
 
     window.addEventListener('mousemove', handleMouseMove);
     window.addEventListener('mouseup', handleMouseUp);
+  };
+
+  const toggleHistoryTaskSelection = (taskId: string, event: MouseEvent<HTMLElement>) => {
+    event.stopPropagation();
+    if (selectionSuppressClickRef.current) {
+      event.preventDefault();
+      return;
+    }
+    setHistoryMenu(null);
+    if (event.ctrlKey || event.metaKey || event.shiftKey) {
+      setSelectedHistoryTaskIds((current) => {
+        const next = new Set(current);
+        if (next.has(taskId)) next.delete(taskId);
+        else next.add(taskId);
+        selectedHistoryTaskIdsRef.current = next;
+        return next;
+      });
+      return;
+    }
+    void selectHistoryTask(taskId);
+  };
+
+  const cacheHistorySelectionRects = () => {
+    const rects: SelectionRect[] = [];
+    const elementMap = new Map<string, HTMLElement>();
+    historyGalleryRef.current?.querySelectorAll<HTMLElement>('[data-history-task-id]').forEach((element) => {
+      const taskId = element.dataset.historyTaskId;
+      if (!taskId) return;
+      const rect = element.getBoundingClientRect();
+      rects.push({
+        id: taskId,
+        left: rect.left,
+        right: rect.right,
+        top: rect.top,
+        bottom: rect.bottom,
+        element,
+      });
+      elementMap.set(taskId, element);
+    });
+    historySelectionRectsRef.current = rects.sort((rectA, rectB) => rectA.top - rectB.top || rectA.left - rectB.left);
+    historySelectionElementMapRef.current = elementMap;
+  };
+
+  const setSelectedHistoryTaskIdsIfChanged = (nextIds: Set<string>) => {
+    const currentIds = selectedHistoryTaskIdsRef.current;
+    if (currentIds.size === nextIds.size && [...nextIds].every((id) => currentIds.has(id))) {
+      return;
+    }
+
+    selectedHistoryTaskIdsRef.current = nextIds;
+    setSelectedHistoryTaskIds(nextIds);
+  };
+
+  const toggleHistorySelectionPreviewClass = (taskId: string, selected: boolean) => {
+    const element = historySelectionElementMapRef.current.get(taskId);
+    if (!element) return;
+    element.classList.toggle('xobi-history-card-active', selected);
+    element.classList.toggle('xobi-history-card-selected', selected);
+    element.setAttribute('aria-pressed', selected ? 'true' : 'false');
+  };
+
+  const applyHistorySelectionPreview = (nextIds: Set<string>) => {
+    const currentIds = historySelectionLiveIdsRef.current ?? selectedHistoryTaskIdsRef.current;
+    if (currentIds.size === nextIds.size && [...nextIds].every((id) => currentIds.has(id))) {
+      return;
+    }
+
+    currentIds.forEach((id) => {
+      if (!nextIds.has(id)) toggleHistorySelectionPreviewClass(id, false);
+    });
+    nextIds.forEach((id) => {
+      if (!currentIds.has(id)) toggleHistorySelectionPreviewClass(id, true);
+    });
+    historySelectionLiveIdsRef.current = nextIds;
+  };
+
+  const selectHistoryTasksInBox = (box: SelectionBounds) => {
+    const nextIds = new Set(historySelectionBaseIdsRef.current);
+    for (const rect of historySelectionRectsRef.current) {
+      if (rect.bottom < box.top) continue;
+      if (rect.top > box.bottom) break;
+      const intersects = rect.left <= box.right && rect.right >= box.left && rect.top <= box.bottom && rect.bottom >= box.top;
+      if (intersects) nextIds.add(rect.id);
+    }
+    applyHistorySelectionPreview(nextIds);
+  };
+
+  const beginHistorySelection = (event: MouseEvent<HTMLElement>) => {
+    if (event.button !== 0 || selectedHistoryTaskId) return;
+    const target = event.target as HTMLElement;
+    if (target.closest('input,textarea,select,a,[data-history-menu-button],button:not([data-history-task-id])')) return;
+    if (target.closest('[data-history-task-id]')) return;
+
+    const additive = event.ctrlKey || event.metaKey || event.shiftKey;
+    if (!additive && selectedHistoryTaskIdsRef.current.size > 0) {
+      setSelectedHistoryTaskIdsIfChanged(new Set());
+    }
+    historySelectionBaseIdsRef.current = new Set(additive ? selectedHistoryTaskIdsRef.current : []);
+    cacheHistorySelectionRects();
+    historySelectionDragRef.current = {
+      startX: event.clientX,
+      startY: event.clientY,
+      additive,
+      isSelecting: false,
+    };
+
+    const makeBox = (clientX: number, clientY: number) => {
+      const drag = historySelectionDragRef.current;
+      const rootRect = historyGalleryRef.current?.getBoundingClientRect();
+      if (!drag || !rootRect) return null;
+      return {
+        left: Math.max(Math.min(drag.startX, clientX), rootRect.left),
+        right: Math.min(Math.max(drag.startX, clientX), rootRect.right),
+        top: Math.max(Math.min(drag.startY, clientY), rootRect.top),
+        bottom: Math.min(Math.max(drag.startY, clientY), rootRect.bottom),
+      };
+    };
+
+    const finishSelection = (wasDragging: boolean) => {
+      const finalIds = historySelectionLiveIdsRef.current;
+      historySelectionDragRef.current = null;
+      historySelectionPointRef.current = null;
+      historySelectionLiveIdsRef.current = null;
+      historySelectionRectsRef.current = [];
+      historySelectionElementMapRef.current = new Map();
+      if (historySelectionFrameRef.current !== null) {
+        window.cancelAnimationFrame(historySelectionFrameRef.current);
+        historySelectionFrameRef.current = null;
+      }
+      document.body.classList.remove('ui-is-box-selecting');
+      hideSelectionOverlay();
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+      if (wasDragging) {
+        if (finalIds) {
+          setSelectedHistoryTaskIdsIfChanged(finalIds);
+        }
+        selectionSuppressClickRef.current = true;
+        window.setTimeout(() => {
+          selectionSuppressClickRef.current = false;
+        }, 120);
+      }
+    };
+
+    const runSelectionFrame = () => {
+      historySelectionFrameRef.current = null;
+      const drag = historySelectionDragRef.current;
+      const point = historySelectionPointRef.current;
+      if (!drag || !point) return;
+
+      const distance = Math.hypot(point.clientX - drag.startX, point.clientY - drag.startY);
+      if (!drag.isSelecting && distance < 5) return;
+
+      if (!drag.isSelecting) {
+        drag.isSelecting = true;
+        setHistoryMenu(null);
+        if (!drag.additive) applyHistorySelectionPreview(new Set());
+        document.body.classList.add('ui-is-box-selecting');
+      }
+
+      updateSelectionOverlay(drag.startX, drag.startY, point.clientX, point.clientY);
+      const box = makeBox(point.clientX, point.clientY);
+      if (box) selectHistoryTasksInBox(box);
+    };
+
+    const scheduleSelectionFrame = () => {
+      if (historySelectionFrameRef.current !== null) return;
+      historySelectionFrameRef.current = window.requestAnimationFrame(runSelectionFrame);
+    };
+
+    const handleMouseMove = (moveEvent: globalThis.MouseEvent) => {
+      const drag = historySelectionDragRef.current;
+      if (!drag) return;
+      historySelectionPointRef.current = {
+        clientX: moveEvent.clientX,
+        clientY: moveEvent.clientY,
+      };
+      moveEvent.preventDefault();
+      scheduleSelectionFrame();
+    };
+
+    const handleMouseUp = (upEvent: globalThis.MouseEvent) => {
+      const drag = historySelectionDragRef.current;
+      if (!drag) return;
+      const wasDragging = drag.isSelecting;
+      const box = makeBox(upEvent.clientX, upEvent.clientY);
+      if (wasDragging && box) selectHistoryTasksInBox(box);
+      finishSelection(wasDragging);
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+  };
+
+  const openHistoryMenu = (event: MouseEvent, taskId: string) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const selectedIds = selectedHistoryTaskIdsRef.current;
+    const taskIds = selectedIds.has(taskId) && selectedIds.size > 0 ? [...selectedIds] : [taskId];
+    setSelectedHistoryTaskIdsIfChanged(new Set(taskIds));
+    setHistoryMenu({ taskIds, x: event.clientX, y: event.clientY });
   };
 
 
@@ -3690,34 +4916,62 @@ export default function ImageTranslator() {
       duplicateOutputPaths,
     };
   }, [manifestEntries, tasks]);
-  const pausedCount = tasks.filter((task) => task.status === 'paused').length;
-  const startableCount = tasks.filter((task) => task.status === 'idle' || task.status === 'error').length;
+  const taskStats = useMemo(() => {
+    const stats = {
+      pausedCount: 0,
+      startableCount: 0,
+      activeProcessingCount: 0,
+      copiedCount: 0,
+      retryingCount: 0,
+      failedCount: 0,
+      detectingCount: 0,
+      extractingCount: 0,
+      generatingCount: 0,
+      detectedTextCount: 0,
+      uploadedFolderCount: 0,
+      groupCount: 0,
+      totalImageCount: manifestEntries.length,
+    };
+
+    tasks.forEach((task) => {
+      if (task.status === 'paused') stats.pausedCount += 1;
+      if (task.status === 'idle' || task.status === 'error') stats.startableCount += 1;
+      if (task.status === 'detecting') stats.detectingCount += 1;
+      if (task.status === 'extracting') stats.extractingCount += 1;
+      if (task.status === 'generating') stats.generatingCount += 1;
+      if (task.status === 'retrying') stats.retryingCount += 1;
+      if (task.status === 'copied') stats.copiedCount += 1;
+      if (task.status === 'error') stats.failedCount += 1;
+      if (task.result?.hasText === true) stats.detectedTextCount += 1;
+    });
+
+    stats.activeProcessingCount =
+      stats.detectingCount + stats.extractingCount + stats.generatingCount + stats.retryingCount;
+    stats.uploadedFolderCount = new Set(
+      manifestEntries.map((task) => task.rootFolder).filter(Boolean),
+    ).size;
+    stats.groupCount = new Set(manifestEntries.map((task) => task.groupLabel)).size;
+    return stats;
+  }, [manifestEntries, tasks]);
+
+  const {
+    pausedCount,
+    startableCount,
+    activeProcessingCount,
+    copiedCount,
+    retryingCount,
+    failedCount,
+    detectingCount,
+    extractingCount,
+    generatingCount,
+    detectedTextCount,
+    uploadedFolderCount,
+    groupCount,
+    totalImageCount,
+  } = taskStats;
   const pendingCount = startableCount + pausedCount;
   const primaryRunLabel = pausedCount > 0 && startableCount === 0 ? '继续' : pausedCount > 0 ? '继续/开始' : '开始';
-  const activeProcessingCount = tasks.filter(
-    (task) => task.status === 'detecting' || task.status === 'extracting' || task.status === 'generating' || task.status === 'retrying',
-  ).length;
-  const pausableCount = tasks.filter(
-    (task) => !['success', 'copied', 'paused'].includes(task.status),
-  ).length;
-  const copiedCount = tasks.filter((task) => task.status === 'copied').length;
-  const retryingCount = tasks.filter((task) => task.status === 'retrying').length;
-  const failedCount = tasks.filter((task) => task.status === 'error').length;
-  const progressedCount = tasks.filter((task) => task.status !== 'idle' && task.status !== 'paused').length;
   const outputReadyCount = batchIntegrity.readyCount;
-  const detectingCount = tasks.filter((task) => task.status === 'detecting').length;
-  const extractingCount = tasks.filter((task) => task.status === 'extracting').length;
-  const generatingCount = tasks.filter((task) => task.status === 'generating').length;
-  const totalRetryCount = tasks.reduce(
-    (total, task) => total + task.retryCount,
-    0,
-  );
-  const detectedTextCount = tasks.filter((task) => task.result?.hasText === true).length;
-  const uploadedFolderCount = new Set(
-    manifestEntries.map((task) => task.rootFolder).filter(Boolean),
-  ).size;
-  const groupCount = new Set(manifestEntries.map((task) => task.groupLabel)).size;
-  const totalImageCount = manifestEntries.length;
   const hasRequestConfig =
     settings.requestHeadersText.trim() !== '{}' ||
     settings.requestQueryParamsText.trim() !== '{}';
@@ -3727,6 +4981,14 @@ export default function ImageTranslator() {
   const batchElapsedLabel = batchStartedAt
     ? formatDuration((batchCompletedAt ?? nowTimestamp) - batchStartedAt)
     : '未开始';
+  const batchStateLabel =
+    batchRunState === 'running'
+      ? `运行中 ${activeProcessingCount}`
+      : batchRunState === 'paused'
+        ? '已暂停'
+        : batchRunState === 'completed'
+          ? '已完成'
+          : '未开始';
   const groupedTasks = useMemo(
     () =>
       Array.from(
@@ -3748,7 +5010,7 @@ export default function ImageTranslator() {
   );
 
   const selectedHistoryTask = useMemo(
-    () => historyTasks.find((task) => task.id === selectedHistoryTaskId) ?? historyTasks[0],
+    () => historyTasks.find((task) => task.id === selectedHistoryTaskId) ?? null,
     [historyTasks, selectedHistoryTaskId],
   );
   const selectedHistoryDetailReady = Boolean(selectedHistoryTask && historyDetailTaskIds.has(selectedHistoryTask.id));
@@ -3758,27 +5020,35 @@ export default function ImageTranslator() {
     : 0;
 
   const selectedTaskCount = selectedTaskIds.size;
-  const selectedResultCount = tasks.filter((task) => selectedTaskIds.has(task.id) && task.generatedUrl).length;
+  const selectedPausedTaskIds = useMemo(
+    () => tasks
+      .filter((task) => selectedTaskIds.has(task.id) && task.status === 'paused')
+      .map((task) => task.id),
+    [selectedTaskIds, tasks],
+  );
+  const selectedPausableCount = useMemo(
+    () => tasks.filter((task) => selectedTaskIds.has(task.id) && !['success', 'copied', 'paused'].includes(task.status)).length,
+    [selectedTaskIds, tasks],
+  );
+  const selectedActionIsContinue = selectedPausedTaskIds.length > 0 && selectedPausableCount === 0;
+  const selectedActionDisabled = selectedTaskCount === 0 || (selectedActionIsContinue ? selectedPausedTaskIds.length === 0 : selectedPausableCount === 0);
+  const selectedResultCount = useMemo(
+    () => tasks.filter((task) => selectedTaskIds.has(task.id) && task.generatedUrl).length,
+    [selectedTaskIds, tasks],
+  );
   const selectedAspectRatioOption = getAspectRatioOption(outputAspectRatio);
   const progressPercent = totalImageCount ? Math.round((outputReadyCount / totalImageCount) * 100) : 0;
-  const selectionBoxStyle = selectionBox
-    ? {
-        left: Math.min(selectionBox.startX, selectionBox.currentX),
-        top: Math.min(selectionBox.startY, selectionBox.currentY),
-        width: Math.abs(selectionBox.currentX - selectionBox.startX),
-        height: Math.abs(selectionBox.currentY - selectionBox.startY),
-      }
-    : null;
   const canvasGridClass = totalImageCount <= 1
     ? 'mx-auto grid w-full max-w-[720px] grid-cols-1 place-items-center gap-5'
     : totalImageCount === 2
       ? 'mx-auto grid w-full max-w-[1120px] grid-cols-1 place-items-center gap-5 lg:grid-cols-2'
-      : 'grid gap-4 [grid-template-columns:repeat(auto-fill,minmax(300px,1fr))]';
+      : 'grid gap-4 [grid-template-columns:repeat(auto-fill,minmax(min(100%,280px),1fr))]';
   const cardSizeClass = totalImageCount <= 1 ? 'w-full max-w-[620px]' : 'w-full';
+  const consoleDockOpen = mobileConsoleOpen || desktopConsoleOpen;
 
   return (
     <>
-      <div className="ui-shell relative min-h-screen overflow-x-hidden bg-[#050505] text-white">
+      <div className={cn('ui-shell relative min-h-screen overflow-x-hidden bg-[#050505] text-white', totalImageCount > 80 && 'ui-large-batch')}>
         <style jsx global>{`
           :root {
             --xobi-ink: #020303;
@@ -3797,6 +5067,24 @@ export default function ImageTranslator() {
           html,
           body { background: var(--xobi-ink); }
           body.ui-is-box-selecting { cursor: crosshair; }
+          body.ui-is-box-selecting .ui-task-card {
+            transition: none !important;
+          }
+          body.ui-is-box-selecting .ui-task-card:hover {
+            transform: none !important;
+          }
+          body.ui-is-box-selecting .ui-task-card::after {
+            opacity: 0.18 !important;
+          }
+          body.ui-is-box-selecting .xobi-history-gallery-card {
+            transition: none !important;
+          }
+          body.ui-is-box-selecting .xobi-history-gallery-card:hover {
+            transform: none !important;
+          }
+          body.ui-is-box-selecting .xobi-history-card-selected::before {
+            box-shadow: none !important;
+          }
           * { scrollbar-width: thin; scrollbar-color: rgba(182, 242, 20, 0.42) transparent; }
           ::-webkit-scrollbar { width: 5px; height: 5px; }
           ::-webkit-scrollbar-thumb { background: rgba(182, 242, 20, 0.46); border-radius: 999px; }
@@ -3825,16 +5113,6 @@ export default function ImageTranslator() {
             background-size: 5px 5px, 5px 5px;
             background-repeat: no-repeat;
           }
-          .ui-shell [class*="text-emerald"] { color: var(--xobi-lime) !important; }
-          .ui-shell [class*="border-emerald"] { border-color: rgba(182, 242, 20, 0.42) !important; }
-          .ui-shell [class*="bg-emerald"] { background-color: rgba(182, 242, 20, 0.14) !important; }
-          .ui-shell .bg-emerald-500,
-          .ui-shell .bg-emerald-600 { background-color: var(--xobi-lime) !important; color: #060707 !important; }
-          .ui-shell [class*="hover:bg-emerald"]:hover { background-color: rgba(182, 242, 20, 0.20) !important; }
-          .ui-shell [class*="hover:border-emerald"]:hover { border-color: rgba(182, 242, 20, 0.62) !important; }
-          .ui-shell [class*="focus:border-emerald"]:focus { border-color: var(--xobi-lime) !important; }
-          .ui-shell [class*="from-emerald"] { --tw-gradient-from: var(--xobi-lime) var(--tw-gradient-from-position) !important; --tw-gradient-to: rgba(182, 242, 20, 0) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
-          .ui-shell [class*="to-lime"] { --tw-gradient-to: var(--xobi-cyan) var(--tw-gradient-to-position) !important; }
           .ui-shell::before {
             content: '';
             position: fixed;
@@ -3957,13 +5235,15 @@ export default function ImageTranslator() {
           }
           .ui-task-card {
             position: relative;
+            contain: layout paint style;
+            content-visibility: auto;
+            contain-intrinsic-size: 340px 320px;
             animation: task-pop 260ms ease both;
             background: linear-gradient(180deg, rgba(22,19,27,0.96), rgba(8,7,10,0.99)) !important;
             border-color: rgba(255,255,255,0.13) !important;
             box-shadow: inset 0 1px 0 rgba(255,255,255,0.06), 0 18px 48px rgba(0,0,0,0.28);
           }
           .ui-task-card-selected {
-            transform: translateY(-2px);
             border-color: rgba(182,242,20,0.78) !important;
             box-shadow: 0 0 0 1px rgba(182,242,20,0.40), 0 18px 62px rgba(182,242,20,0.14), inset 0 1px 0 rgba(255,255,255,0.12);
           }
@@ -3974,6 +5254,21 @@ export default function ImageTranslator() {
           @keyframes upload-orbit {
             0%, 100% { transform: translateY(0); filter: brightness(1); }
             50% { transform: translateY(-4px); filter: brightness(1.18); }
+          }
+          .ui-large-batch::before,
+          .ui-large-batch::after,
+          .ui-large-batch .ui-task-card {
+            animation: none !important;
+          }
+          .ui-large-batch .ui-task-card:hover,
+          .ui-large-batch .ui-task-card-selected {
+            transform: none !important;
+          }
+          .ui-large-batch .ui-task-card::after {
+            opacity: 0.18;
+          }
+          .ui-large-batch [class*="bg-white/"] {
+            backdrop-filter: none;
           }
           .ui-preview-pane {
             background:
@@ -4000,88 +5295,167 @@ export default function ImageTranslator() {
             border: 1px solid rgba(255,255,255,0.10);
             box-shadow: inset 0 1px 0 rgba(255,255,255,0.06);
           }
+          .ui-floating-toast {
+            position: fixed;
+            right: 16px;
+            top: 72px;
+            z-index: 82;
+            width: min(430px, calc(100vw - 24px));
+            pointer-events: none;
+          }
+          .ui-floating-toast-card {
+            border-radius: 20px;
+            border: 1px solid rgba(182,242,20,0.20);
+            background: rgba(4,20,14,0.92);
+            padding: 0.9rem 1rem;
+            color: rgba(236,253,245,0.95);
+            font-size: 0.875rem;
+            line-height: 1.55;
+            box-shadow: 0 18px 54px rgba(0,0,0,0.48), inset 0 1px 0 rgba(255,255,255,0.08);
+            backdrop-filter: blur(18px);
+            animation: toast-in 180ms cubic-bezier(0.2,0.8,0.2,1) both;
+          }
+          .ui-floating-toast-card[data-tone='error'] {
+            border-color: rgba(248,113,113,0.28);
+            background: rgba(40,12,14,0.92);
+            color: rgb(254,202,202);
+          }
+          @keyframes toast-in {
+            from { opacity: 0; transform: translateX(18px) scale(0.985); }
+            to { opacity: 1; transform: translateX(0) scale(1); }
+          }
+          @media (max-width: 640px) {
+            .ui-floating-toast {
+              left: 10px;
+              right: 10px;
+              top: auto;
+              bottom: 76px;
+              width: auto;
+            }
+          }
 
           .ui-side-dock {
             position: fixed;
-            right: 0;
+            left: 0;
             top: 57px;
             bottom: 0;
             z-index: 45;
-            width: 74px;
-            pointer-events: auto;
-            transition: width 240ms cubic-bezier(0.2, 0.8, 0.2, 1);
+            width: min(402px, calc(100vw - 20px));
+            pointer-events: none;
           }
-          .ui-side-dock:hover,
-          .ui-side-dock:focus-within {
-            width: min(424px, calc(100vw - 12px));
+          .ui-mobile-console-toggle,
+          .ui-side-dock-close {
+            display: none;
           }
           .ui-side-dock::before {
-            content: '';
-            position: absolute;
-            inset: 0 0 0 auto;
-            width: 74px;
-            pointer-events: auto;
-            background: linear-gradient(90deg, transparent, rgba(182,242,20,0.045));
+            display: none;
           }
           .ui-side-dock-hotline {
-            display: block;
+            display: inline-flex;
             position: absolute;
-            right: 0;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            width: 14px;
+            padding: 0;
+            align-items: center;
+            justify-content: center;
+            appearance: none;
+            border: 0;
+            border-radius: 0;
+            background: transparent;
+            color: transparent;
+            font-size: 0;
+            font-weight: 0;
+            letter-spacing: 0;
+            line-height: 1;
+            pointer-events: auto;
+            cursor: pointer;
+            opacity: 1;
+          }
+          .ui-side-dock-hotline::before {
+            content: '';
+            position: absolute;
+            left: 0;
             top: 18px;
             bottom: 18px;
-            width: 8px;
-            border-radius: 999px 0 0 999px;
-            background: linear-gradient(180deg, rgba(182,242,20,0), rgba(182,242,20,0.54), rgba(94,234,212,0.28), rgba(182,242,20,0));
-            box-shadow: -18px 0 36px rgba(182,242,20,0.10);
-            opacity: 0.86;
-            transition: opacity 180ms ease, transform 180ms ease;
+            width: 2px;
+            border-radius: 999px;
+            background: linear-gradient(180deg, rgba(182,242,20,0), rgba(182,242,20,0.56), rgba(94,234,212,0.26), rgba(182,242,20,0));
+            box-shadow: 10px 0 28px rgba(182,242,20,0.10);
+            opacity: 0.34;
+            transition: opacity 160ms ease, width 160ms ease, box-shadow 160ms ease;
           }
-          .ui-side-dock:hover .ui-side-dock-hotline,
-          .ui-side-dock:focus-within .ui-side-dock-hotline {
-            opacity: 0;
-            transform: translateX(8px);
+          .ui-side-dock-hotline:hover::before,
+          .ui-side-dock.ui-side-dock-open .ui-side-dock-hotline::before {
+            width: 4px;
+            opacity: 0.78;
+            box-shadow: 12px 0 34px rgba(182,242,20,0.18);
+          }
+          .ui-side-dock-hotline:focus-visible {
+            outline: 2px solid rgba(182,242,20,0.68);
+            outline-offset: 3px;
+          }
+          .ui-side-dock.ui-side-dock-open .ui-side-dock-hotline {
+            pointer-events: auto;
           }
           .ui-side-dock-panel {
             position: absolute;
-            top: 10px;
-            right: 10px;
-            bottom: 14px;
+            z-index: 1;
+            top: 0;
+            left: 0;
+            bottom: 0;
             width: min(390px, calc(100vw - 36px));
-            transform: translateX(calc(100% + 18px));
+            transform: translateX(calc(-100% - 2px));
             opacity: 0;
+            visibility: hidden;
             pointer-events: none;
-            transition: transform 240ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 180ms ease;
-            border-radius: 24px 0 0 24px !important;
+            overscroll-behavior: contain;
+            transition: transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 160ms ease, visibility 160ms ease;
+            border-radius: 0 22px 22px 0 !important;
           }
-          .ui-side-dock:hover .ui-side-dock-panel,
-          .ui-side-dock:focus-within .ui-side-dock-panel {
+          .ui-side-dock.ui-side-dock-open .ui-side-dock-panel {
             transform: translateX(0);
             opacity: 1;
+            visibility: visible;
             pointer-events: auto;
           }
           @media (max-width: 1279px) {
+            .ui-mobile-console-toggle {
+              display: inline-flex;
+              position: fixed;
+              left: 14px;
+              bottom: 14px;
+              z-index: 58;
+              min-height: 46px;
+              align-items: center;
+              justify-content: center;
+              gap: 0.5rem;
+              border-radius: 999px;
+              border: 1px solid rgba(182,242,20,0.28);
+              background: rgba(10,12,12,0.94);
+              padding: 0 1rem;
+              color: rgba(236,253,245,0.92);
+              font-size: 0.875rem;
+              font-weight: 700;
+              box-shadow: 0 18px 46px rgba(0,0,0,0.45), 0 0 24px rgba(182,242,20,0.12);
+              backdrop-filter: blur(18px);
+            }
+            .ui-side-dock-close {
+              display: inline-flex;
+            }
             .ui-side-dock {
               top: auto;
               left: 0;
+              right: 0;
+              bottom: 0;
               width: 100%;
-              height: 72px;
-            }
-            .ui-side-dock:hover,
-            .ui-side-dock:focus-within {
-              width: 100%;
-              height: min(78vh, 620px);
+              height: 0;
+              pointer-events: none;
             }
             .ui-side-dock::before { display: none; }
             .ui-side-dock-hotline {
-              left: 18px;
-              right: 18px;
-              top: auto;
-              bottom: 10px;
-              width: auto;
-              height: 8px;
-              border-radius: 999px;
-              background: linear-gradient(90deg, rgba(182,242,20,0), rgba(182,242,20,0.42), rgba(94,234,212,0));
-              box-shadow: 0 -12px 30px rgba(182,242,20,0.08);
+              display: none;
             }
             .ui-side-dock-panel {
               left: 10px;
@@ -4090,13 +5464,25 @@ export default function ImageTranslator() {
               top: auto;
               width: auto;
               height: min(72vh, 560px);
+              max-height: calc(100dvh - 86px);
               transform: translateY(calc(100% + 18px));
               border-radius: 24px !important;
             }
-            .ui-side-dock:hover .ui-side-dock-panel,
-            .ui-side-dock:focus-within .ui-side-dock-panel {
+            .ui-side-dock.ui-side-dock-open {
+              height: 100%;
+              pointer-events: auto;
+            }
+            .ui-side-dock.ui-side-dock-open::after {
+              content: '';
+              position: absolute;
+              inset: 0;
+              background: rgba(0,0,0,0.32);
+            }
+            .ui-side-dock.ui-side-dock-open .ui-side-dock-panel {
               transform: translateY(0);
               opacity: 1;
+              visibility: visible;
+              pointer-events: auto;
             }
           }
           @media (prefers-reduced-motion: reduce) {
@@ -4167,9 +5553,6 @@ export default function ImageTranslator() {
             outline: 2px solid rgba(182,242,20,0.70);
             outline-offset: 2px;
           }
-          .ui-shell [class*="bg-white/"] {
-            backdrop-filter: blur(14px);
-          }
           .ui-shell [class*="rounded-xl"],
           .ui-shell [class*="rounded-2xl"],
           .ui-shell [class*="rounded-3xl"] {
@@ -4218,8 +5601,20 @@ export default function ImageTranslator() {
               radial-gradient(circle at 18% 0%, rgba(182,242,20,0.09), transparent 30rem),
               radial-gradient(circle at 82% 0%, rgba(94,234,212,0.08), transparent 32rem),
               linear-gradient(180deg, rgba(12,12,14,0.98), rgba(3,3,4,0.98));
+            overscroll-behavior: contain;
+          }
+          .ui-history-modal-backdrop {
+            overscroll-behavior: contain;
           }
         `}</style>
+        <div ref={selectionOverlayRef} className="ui-selection-box" style={{ display: 'none' }} />
+        {globalError && (
+          <div className="ui-floating-toast" role="status" aria-live="polite">
+            <div className="ui-floating-toast-card" data-tone={getGlobalMessageTone(globalError)}>
+              {globalError}
+            </div>
+          </div>
+        )}
 
         <header className="ui-topbar sticky top-0 z-40 border-b border-white/10 backdrop-blur-xl">
           <div className="flex min-h-14 flex-wrap items-center gap-2 px-3 py-2 md:px-4">
@@ -4286,7 +5681,7 @@ export default function ImageTranslator() {
             <button
               type="button"
               onClick={openHistoryPanel}
-              className="ui-button inline-flex h-9 items-center justify-center gap-1.5 rounded-lg border border-emerald-400/20 bg-emerald-400/10 px-3 text-xs font-medium text-emerald-100 transition hover:border-emerald-300/35 hover:bg-emerald-400/15"
+              className={cn('ui-button h-9 items-center justify-center gap-1.5 rounded-lg border border-emerald-400/20 bg-emerald-400/10 px-3 text-xs font-medium text-emerald-100 transition hover:border-emerald-300/35 hover:bg-emerald-400/15', tasks.length === 0 ? 'hidden' : 'inline-flex')}
             >
               <FolderOpen className="h-3.5 w-3.5" />
               历史 {historyTasks.length}
@@ -4296,7 +5691,7 @@ export default function ImageTranslator() {
               type="button"
               ref={settingsButtonRef}
               onClick={openSettings}
-              className="ui-button inline-flex h-9 items-center justify-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.06] px-3 text-xs font-medium text-white/65 transition hover:border-white/20 hover:bg-white/[0.10] hover:text-white"
+              className={cn('ui-button h-9 items-center justify-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.06] px-3 text-xs font-medium text-white/65 transition hover:border-white/20 hover:bg-white/[0.10] hover:text-white', tasks.length === 0 ? 'hidden' : 'inline-flex')}
             >
               <Settings className="h-3.5 w-3.5" />
               设置
@@ -4308,10 +5703,19 @@ export default function ImageTranslator() {
           <input id="image-upload-input" name="images" ref={fileInputRef} type="file" accept="image/*" multiple onChange={handleFileChange} className="fixed -left-[9999px] top-0 h-px w-px opacity-0" />
           <input id="folder-upload-input" name="folderImages" ref={folderInputRef} type="file" accept="image/*" multiple onChange={handleFolderChange} className="fixed -left-[9999px] top-0 h-px w-px opacity-0" {...({ webkitdirectory: '', directory: '' } as Record<string, string>)} />
 
-          <section className={cn(tasks.length === 0 ? 'flex flex-1 p-0' : 'border-b border-white/10 bg-[#070708]/95 px-3 py-4 md:px-4')}>
+          <section className={cn(tasks.length === 0 ? 'flex flex-1 p-0' : 'hidden')}>
             <div className={cn('grid gap-3', tasks.length === 0 ? 'h-full w-full max-w-none' : 'w-full max-w-none')}>
               <div
+                role="button"
+                tabIndex={0}
+                aria-label="上传图片或文件夹"
                 onClick={openImagePicker}
+                onKeyDown={(event: KeyboardEvent<HTMLDivElement>) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    openImagePicker();
+                  }
+                }}
                 onDragOver={(event) => event.preventDefault()}
                 onDrop={handleDrop}
                 className={cn('ui-upload-zone w-full cursor-pointer items-center justify-center border border-dashed border-white/14 px-6 py-10 transition hover:border-lime-300/55', tasks.length === 0 ? 'flex min-h-[calc(100vh-57px)] rounded-none border-x-0 border-b-0 border-t' : 'hidden')}
@@ -4363,14 +5767,14 @@ export default function ImageTranslator() {
                 <span className="block text-[11px] uppercase tracking-[0.18em] text-white/28">输出比例</span>
                 <div className="flex flex-wrap gap-1.5 rounded-2xl border border-white/10 bg-black/30 p-1.5">
                   {ASPECT_RATIO_OPTIONS.map((option) => (
-                    <button key={option.value} type="button" title={option.hint} onClick={() => setOutputAspectRatio(option.value)} disabled={isProcessingBatch} className={cn('h-8 rounded-xl border px-3 text-xs tabular-nums transition', outputAspectRatio === option.value ? 'border-emerald-300 bg-emerald-500 text-black shadow-[0_0_20px_rgba(16,185,129,0.22)]' : 'border-transparent bg-white/[0.04] text-white/45 hover:bg-white/[0.08] hover:text-white/75')}>{option.label}</button>
+                    <button key={option.value} type="button" title={option.hint} onClick={() => selectOutputAspectRatio(option.value)} disabled={isProcessingBatch} className={cn('h-8 rounded-xl border px-3 text-xs tabular-nums transition', outputAspectRatio === option.value ? 'border-emerald-300 bg-emerald-500 text-black shadow-[0_0_20px_rgba(16,185,129,0.22)]' : 'border-transparent bg-white/[0.04] text-white/45 hover:bg-white/[0.08] hover:text-white/75')}>{option.label}</button>
                   ))}
                 </div>
               </div>
 
               <div className="flex flex-col gap-2 sm:flex-row lg:ml-auto">
                 <button id="batch-start-button" type="button" onClick={handlePrimaryRunAction} disabled={pendingCount === 0 && !isProcessingBatch} className={cn('inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition', pendingCount === 0 && !isProcessingBatch ? 'cursor-not-allowed bg-white/10 text-white/25' : 'bg-emerald-500 text-black hover:bg-emerald-400')}>
-                  {isProcessingBatch ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+                  {isProcessingBatch ? <PauseCircle className="h-4 w-4" /> : pausedCount > 0 && startableCount === 0 ? <PlayCircle className="h-4 w-4" /> : <Sparkles className="h-4 w-4" />}
                   {isProcessingBatch ? '暂停' : `${primaryRunLabel} (${pendingCount})`}
                 </button>
                 
@@ -4381,10 +5785,9 @@ export default function ImageTranslator() {
               </div>
             </div>
 
-            {globalError && <div className="mt-3 rounded-xl border border-red-400/25 bg-red-500/10 px-4 py-3 text-sm text-red-200">{globalError}</div>}
           </section>
 
-          <section ref={canvasRef} onMouseDown={beginCanvasSelection} onClick={(event) => { if (selectionSuppressClickRef.current) { event.preventDefault(); return; } if (event.target === event.currentTarget) clearTaskSelection(); }} className={cn('ui-canvas-workspace flex-1 overflow-auto px-3 py-3 md:px-4', tasks.length === 0 && 'hidden')}>
+          <section ref={canvasRef} onMouseDown={beginCanvasSelection} onClick={(event) => { if (selectionSuppressClickRef.current) { event.preventDefault(); return; } if (isBlankSelectionSurfaceClick(event, '[data-task-card]')) clearTaskSelection(); }} className={cn('ui-canvas-workspace flex-1 overflow-auto px-3 py-3 md:px-4', tasks.length === 0 && 'hidden')}>
             {tasks.length === 0 ? (
               <div className="flex min-h-[38vh] items-center justify-center rounded-2xl border border-white/10 bg-white/[0.025]">
                 <div className="text-center">
@@ -4394,68 +5797,69 @@ export default function ImageTranslator() {
               </div>
             ) : (
               <div className="space-y-5">
-                <div className="sticky top-0 z-20 mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-2 rounded-2xl border border-white/10 bg-black/60 px-3 py-2 text-xs text-white/58 shadow-[0_18px_44px_rgba(0,0,0,0.32)] backdrop-blur-xl">
-                  <div className="flex items-center gap-2">
-                    <span className="rounded-full border border-white/10 bg-white/[0.05] px-3 py-1 text-white/78">画布</span>
-                    <span className="hidden text-white/36 md:inline">框选 / 右键 / Delete / Ctrl+Z</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {selectedTaskCount > 0 && <button type="button" onClick={pauseSelectedTasks} className="inline-flex h-7 items-center gap-1.5 rounded-full border border-amber-300/25 bg-amber-400/10 px-3 text-[11px] text-amber-100 transition hover:bg-amber-400/15"><PauseCircle className="h-3 w-3" />暂停选中</button>}
-                    <span className="rounded-full border border-emerald-300/20 bg-emerald-400/10 px-3 py-1 text-emerald-100">已选 {selectedTaskCount} / 结果 {selectedResultCount}</span>
-                  </div>
-                </div>
-                {groupedTasks.map((group) => (
-                  <div key={group.groupLabel} className="space-y-2">
-                    <div className="flex items-center justify-between gap-3 px-1">
-                      <h2 className="rounded-full border border-white/10 bg-white/[0.035] px-3 py-1 text-xs font-medium text-white/70">{group.groupLabel} · {group.tasks.length}</h2>
-                    </div>
-
-                    <div className={canvasGridClass}>
-                      {group.tasks.map((task) => (
-                        <article key={task.id} data-task-id={task.id} data-task-card onClick={(event) => toggleTaskSelection(task.id, event)} onContextMenu={(event) => openTaskMenu(event, task.id)} className={cn('ui-task-card overflow-hidden rounded-[20px] border border-white/10 transition duration-200 hover:-translate-y-px hover:border-emerald-400/35 hover:shadow-[0_10px_36px_rgba(0,0,0,0.55)]', cardSizeClass, selectedTaskIds.has(task.id) && 'ui-task-card-selected')}>
-                          <div className="flex h-10 items-center gap-2 border-b border-white/10 px-3">
-                            <span className={cn('flex h-4 w-4 shrink-0 items-center justify-center rounded border text-[10px] transition', selectedTaskIds.has(task.id) ? 'border-emerald-300 bg-emerald-400 text-black' : 'border-white/15 bg-white/[0.03] text-transparent')}>✓</span>
-                            <div className="min-w-0 flex-1 truncate text-[11px] text-white/58" title={task.relativePath}>{task.file.name}</div>
-                            <button type="button" onClick={(event) => { event.stopPropagation(); removeTask(task.id); }} disabled={isProcessingBatch} className="flex h-6 w-6 items-center justify-center rounded-md text-white/22 transition hover:bg-red-500/10 hover:text-red-300 disabled:opacity-40"><Trash2 className="h-3.5 w-3.5" /></button>
-                          </div>
-
-                          <div className="grid grid-cols-2 gap-1 bg-black/70 p-1">
-                            <div className="ui-preview-pane relative flex aspect-square min-h-0 items-center justify-center overflow-hidden rounded-xl"><span className="absolute left-2 top-2 z-10 rounded bg-black/65 px-1.5 py-0.5 text-[9px] text-white/55">原图</span><Image src={task.preview} alt="Original" fill unoptimized className="object-contain p-3" /></div>
-                            <div className="ui-preview-pane ui-preview-result relative flex aspect-square min-h-0 items-center justify-center overflow-hidden rounded-xl"><span className="absolute left-2 top-2 z-10 rounded bg-emerald-600/85 px-1.5 py-0.5 text-[9px] text-white">结果</span>{task.generatedUrl ? <Image src={task.generatedUrl} alt="Generated" fill unoptimized className="object-contain p-3" /> : task.status === 'generating' || task.status === 'extracting' || task.status === 'detecting' ? <Loader2 className="h-5 w-5 animate-spin text-emerald-300" /> : <ImageIcon className="h-6 w-6 text-white/14" />}</div>
-                          </div>
-
-                          <div className="px-2.5 py-2">
-                            {task.result?.extractedText && <div className="mb-2 truncate rounded-lg border border-white/8 bg-white/[0.03] px-2 py-1.5 text-[10px] text-white/38">识别：{task.result.extractedText.slice(0, 96)}{task.result.extractedText.length > 96 ? '...' : ''}</div>}
-                            <div className="flex items-center justify-between gap-2">
-                              <div className="min-w-0 flex-1 truncate text-[11px]">
-                                {task.status === 'idle' && <span className="text-white/28">等待处理</span>}
-                                {task.status === 'detecting' && <span className="text-emerald-200">正在识别是否有字...</span>}
-                                {task.status === 'retrying' && <span className="text-amber-300" title={task.error}>{task.error ?? '正在等待自动重试...'}</span>}
-                                {task.status === 'paused' && <span className="text-amber-200">已暂停</span>}
-                                {task.status === 'extracting' && <span className="text-emerald-200">正在提取原文并翻译...</span>}
-                                {task.status === 'generating' && <span className="text-emerald-200">正在 AI 翻译重绘...</span>}
-                                {task.status === 'copied' && <span className="text-sky-300">无字图片，已复制</span>}
-                                {task.status === 'success' && <span className="text-emerald-300">翻译完成</span>}
-                                {task.status === 'error' && <span className="text-red-300" title={task.error}>{task.error}{task.retryCount > 0 ? ` / 已重试 ${task.retryCount} 次` : ''}</span>}
-                              </div>
-                              <button type="button" onClick={(event) => { event.stopPropagation(); openTaskMenu(event, task.id); }} className="rounded-md border border-white/10 px-2 py-1 text-[10px] text-white/42 transition hover:bg-white/[0.06] hover:text-white/70">操作</button>{(task.status === 'success' || task.status === 'copied') && <button type="button" onClick={(event) => { event.stopPropagation(); handleDownloadSingle(task); }} className="flex h-7 w-7 items-center justify-center rounded-md text-emerald-200 transition hover:bg-emerald-500/10 hover:text-white" title="下载当前图片"><Download className="h-3.5 w-3.5" /></button>}
-                            </div>
-                          </div>
-                        </article>
-                      ))}
-                    </div>
-                  </div>
-                ))}
+                <TaskGroupsView
+                  groupedTasks={groupedTasks}
+                  selectedTaskIds={selectedTaskIds}
+                  isProcessingBatch={isProcessingBatch}
+                  canvasGridClass={canvasGridClass}
+                  cardSizeClass={cardSizeClass}
+                  onToggle={toggleTaskSelection}
+                  onOpenMenu={openTaskMenu}
+                  onOpenKeyboardMenu={openTaskKeyboardMenu}
+                  onRemove={removeTask}
+                  onDownload={handleDownloadSingle}
+                />
               </div>
             )}
-            {selectionBoxStyle && <div className="ui-selection-box" style={selectionBoxStyle} />}
           </section>
         </main>
 
         {tasks.length > 0 && (
-          <aside className="ui-side-dock" aria-label="批量控制抽屉">
-            <div className="ui-side-dock-hotline" aria-hidden="true" />
-            <div className="ui-side-dock-panel ui-panel flex flex-col overflow-hidden rounded-l-[26px] border border-white/10 bg-[#101112]/95 shadow-[0_28px_80px_rgba(0,0,0,0.62)] backdrop-blur-xl">
+          <button
+            type="button"
+            className="ui-mobile-console-toggle"
+            aria-controls="batch-console-panel"
+            aria-expanded={mobileConsoleOpen}
+            onClick={() => setMobileConsoleOpen((current) => !current)}
+          >
+            {mobileConsoleOpen ? <X className="h-4 w-4" /> : <Settings className="h-4 w-4" />}
+            {mobileConsoleOpen ? '收起控制台' : '控制台'}
+          </button>
+        )}
+
+        {tasks.length > 0 && (
+          <aside
+            className={cn('ui-side-dock', consoleDockOpen && 'ui-side-dock-open')}
+            aria-label="批量控制抽屉"
+            onMouseEnter={openDesktopConsole}
+            onMouseLeave={scheduleDesktopConsoleClose}
+            onBlur={(event) => {
+              const nextFocus = event.relatedTarget;
+              if (!(nextFocus instanceof Node) || !event.currentTarget.contains(nextFocus)) {
+                closeDesktopConsole();
+              }
+            }}
+          >
+            <button
+              type="button"
+              className="ui-side-dock-hotline"
+              aria-controls="batch-console-panel"
+              aria-expanded={desktopConsoleOpen}
+              aria-label="打开控制台"
+              onClick={openDesktopConsole}
+              onFocus={openDesktopConsole}
+              onMouseEnter={openDesktopConsole}
+              onMouseLeave={scheduleDesktopConsoleClose}
+            >
+              控制台
+            </button>
+            <div
+              id="batch-console-panel"
+              className="ui-side-dock-panel ui-panel flex flex-col overflow-hidden rounded-r-[26px] border border-white/10 bg-[#101112]/95 shadow-[0_28px_80px_rgba(0,0,0,0.62)] backdrop-blur-xl"
+              onMouseEnter={openDesktopConsole}
+              onMouseLeave={scheduleDesktopConsoleClose}
+              onWheelCapture={(event) => event.stopPropagation()}
+            >
               <div className="border-b border-white/10 px-5 py-4">
                 <div className="flex items-start gap-3">
                   <div className="min-w-0 flex-1">
@@ -4472,15 +5876,18 @@ export default function ImageTranslator() {
                       </button>
                     )}
                   </div>
+                  <button type="button" className="ui-side-dock-close rounded-xl border border-white/10 bg-white/[0.05] p-2 text-white/55 transition hover:bg-white/[0.10] hover:text-white" aria-label="关闭控制台" onClick={() => setMobileConsoleOpen(false)}>
+                    <X className="h-4 w-4" />
+                  </button>
                 </div>
                 <p className="mt-2 text-xs leading-5 text-white/42">
                   {uploadedFolderCount > 0
-                    ? `${uploadedFolderCount} 个文件夹 / ${groupCount} 组 / ${totalImageCount} 张 / 耗时 ${batchElapsedLabel}`
-                    : `${totalImageCount} 张 / ${groupCount} 组 / 运行 ${activeProcessingCount} / 耗时 ${batchElapsedLabel}`}
+                    ? `${uploadedFolderCount} 个文件夹 / ${groupCount} 组 / ${totalImageCount} 张 / ${batchStateLabel} / 耗时 ${batchElapsedLabel}`
+                    : `${totalImageCount} 张 / ${groupCount} 组 / ${batchStateLabel} / 耗时 ${batchElapsedLabel}`}
                 </p>
               </div>
 
-              <div className="min-h-0 flex-1 space-y-5 overflow-auto px-5 py-5">
+              <div className="min-h-0 flex-1 space-y-5 overflow-auto overscroll-contain px-5 py-5">
                 <section className="rounded-3xl border border-white/10 bg-black/28 p-4">
                   <div className="flex items-center justify-between gap-3">
                     <div>
@@ -4500,7 +5907,7 @@ export default function ImageTranslator() {
 
                   <div className="mt-3 grid grid-cols-4 gap-1.5 rounded-2xl border border-white/10 bg-black/30 p-1.5">
                     {ASPECT_RATIO_OPTIONS.map((option) => (
-                      <button key={option.value} type="button" title={option.hint} onClick={() => setOutputAspectRatio(option.value)} disabled={isProcessingBatch} className={cn('h-8 rounded-xl border px-2 text-xs tabular-nums transition', outputAspectRatio === option.value ? 'border-emerald-300 bg-emerald-500 text-black' : 'border-transparent bg-white/[0.04] text-white/48 hover:bg-white/[0.08] hover:text-white/80')}>{option.label}</button>
+                      <button key={option.value} type="button" title={option.hint} onClick={() => selectOutputAspectRatio(option.value)} disabled={isProcessingBatch} className={cn('h-8 rounded-xl border px-2 text-xs tabular-nums transition', outputAspectRatio === option.value ? 'border-emerald-300 bg-emerald-500 text-black' : 'border-transparent bg-white/[0.04] text-white/48 hover:bg-white/[0.08] hover:text-white/80')}>{option.label}</button>
                     ))}
                   </div>
                 </section>
@@ -4526,7 +5933,6 @@ export default function ImageTranslator() {
                   </div>
                 </section>
 
-                {globalError && <div className="rounded-2xl border border-red-400/25 bg-red-500/10 px-3 py-2 text-xs leading-5 text-red-200">{globalError}</div>}
               </div>
 
               <div className="border-t border-white/10 bg-black/32 p-4">
@@ -4536,7 +5942,7 @@ export default function ImageTranslator() {
                 </button>
                 <div>
                   <button id="batch-start-button" type="button" onClick={handlePrimaryRunAction} disabled={pendingCount === 0 && !isProcessingBatch} className={cn('inline-flex h-11 w-full items-center justify-center gap-2 rounded-2xl text-sm font-semibold transition', pendingCount === 0 && !isProcessingBatch ? 'cursor-not-allowed bg-white/10 text-white/25' : 'bg-emerald-500 text-black hover:bg-emerald-400')}>
-                    {isProcessingBatch ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+                    {isProcessingBatch ? <PauseCircle className="h-4 w-4" /> : pausedCount > 0 && startableCount === 0 ? <PlayCircle className="h-4 w-4" /> : <Sparkles className="h-4 w-4" />}
                     {isProcessingBatch ? '暂停' : `${primaryRunLabel} (${pendingCount})`}
                   </button>
                 </div>
@@ -4553,10 +5959,10 @@ export default function ImageTranslator() {
 
       {startConfirm && (
         <div className="fixed inset-0 z-[72] flex items-center justify-center bg-black/76 px-4 backdrop-blur-xl" onMouseDown={(event) => { if (event.target === event.currentTarget) setStartConfirm(null); }}>
-          <div className="ui-modal-panel w-full max-w-2xl overflow-hidden rounded-[26px] border border-white/10 shadow-[0_28px_90px_rgba(0,0,0,0.78)]">
+          <div ref={startConfirmDialogRef} role="dialog" aria-modal="true" aria-labelledby="start-confirm-title" tabIndex={-1} className="ui-modal-panel w-full max-w-2xl overflow-hidden rounded-[26px] border border-white/10 shadow-[0_28px_90px_rgba(0,0,0,0.78)]">
             <div className="border-b border-white/10 px-5 py-4">
               <p className="text-[11px] uppercase tracking-[0.22em] text-emerald-200/55">Start Batch</p>
-              <h2 className="mt-1 text-lg font-semibold text-white">{startConfirm.mode === 'continue' ? '继续处理' : '开始翻译'} {startConfirm.count} 张图片</h2>
+              <h2 id="start-confirm-title" className="mt-1 text-lg font-semibold text-white">{startConfirm.mode === 'continue' ? '继续处理' : '开始翻译'} {startConfirm.count} 张图片</h2>
               <p className="mt-2 text-sm leading-6 text-white/48">确认前可以直接改语言和输出比例；已完成的图片不会重复处理。</p>
             </div>
 
@@ -4600,10 +6006,10 @@ export default function ImageTranslator() {
 
       {returnHomeConfirm && (
         <div className="fixed inset-0 z-[72] flex items-center justify-center bg-black/76 px-4 backdrop-blur-xl" onMouseDown={(event) => { if (event.target === event.currentTarget) setReturnHomeConfirm(null); }}>
-          <div className="ui-modal-panel w-full max-w-md overflow-hidden rounded-[26px] border border-white/10 shadow-[0_28px_90px_rgba(0,0,0,0.78)]">
+          <div ref={returnHomeDialogRef} role="dialog" aria-modal="true" aria-labelledby="return-home-title" tabIndex={-1} className="ui-modal-panel w-full max-w-md overflow-hidden rounded-[26px] border border-white/10 shadow-[0_28px_90px_rgba(0,0,0,0.78)]">
             <div className="px-5 py-5">
               <p className="text-[11px] uppercase tracking-[0.22em] text-emerald-200/55">Return Home</p>
-              <h2 className="mt-1 text-lg font-semibold text-white">返回上传主页？</h2>
+              <h2 id="return-home-title" className="mt-1 text-lg font-semibold text-white">返回上传主页？</h2>
               <p className="mt-2 text-sm leading-6 text-white/48">{returnHomeConfirm.hasWorkspace ? '当前工作台显示会清空，历史记录仍会保留。' : '会回到上传图片的首页。'}</p>
             </div>
             <div className="flex justify-end gap-2 border-t border-white/10 bg-black/28 px-5 py-4">
@@ -4616,10 +6022,10 @@ export default function ImageTranslator() {
 
       {pendingUpload && (
         <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/72 px-4 backdrop-blur-xl">
-          <div className="w-full max-w-lg overflow-hidden rounded-[26px] border border-white/10 bg-[#111214] shadow-[0_28px_90px_rgba(0,0,0,0.78)]">
+          <div ref={pendingUploadDialogRef} role="dialog" aria-modal="true" aria-labelledby="pending-upload-title" tabIndex={-1} className="w-full max-w-lg overflow-hidden rounded-[26px] border border-white/10 bg-[#111214] shadow-[0_28px_90px_rgba(0,0,0,0.78)]">
             <div className="border-b border-white/10 px-5 py-4">
               <p className="text-[11px] uppercase tracking-[0.22em] text-emerald-200/55">New Upload</p>
-              <h2 className="mt-1 text-lg font-semibold text-white">这批图片要放到哪里？</h2>
+              <h2 id="pending-upload-title" className="mt-1 text-lg font-semibold text-white">这批图片要放到哪里？</h2>
               <p className="mt-2 text-sm leading-6 text-white/48">
                 当前工作台已有 {tasks.length} 张图片；这次选择了 {pendingUpload.files.length} 个文件。你可以追加到当前项目，也可以先归档当前项目再开启新项目。
               </p>
@@ -4657,6 +6063,7 @@ export default function ImageTranslator() {
             <div className="px-3 py-2 text-[11px] text-white/42">已选 {menuTasks.length} 张 / 结果 {menuTasks.filter((task) => task.generatedUrl).length} 张</div>
             <button type="button" onClick={() => reprocessTasks(taskMenu.taskIds, 'translate')} disabled={isProcessingBatch} className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left transition hover:bg-emerald-500/12 hover:text-white disabled:opacity-40"><RefreshCw className="h-3.5 w-3.5" />重新翻译</button>
             <button type="button" onClick={() => reprocessTasks(taskMenu.taskIds, 'redraw')} disabled={isProcessingBatch || !canRedraw} className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left transition hover:bg-cyan-500/12 hover:text-white disabled:opacity-40"><Sparkles className="h-3.5 w-3.5" />只重新重绘</button>
+            {menuTasks.some((task) => task.status === 'paused') && <button type="button" onClick={() => { const ids = taskMenu.taskIds.filter((id) => tasksRef.current.find((task) => task.id === id)?.status === 'paused'); setTaskMenu(null); void processBatch(ids); }} className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-emerald-100 transition hover:bg-emerald-500/12"><PlayCircle className="h-3.5 w-3.5" />继续选中</button>}
             <button type="button" onClick={() => pauseTasks(taskMenu.taskIds)} disabled={!menuTasks.some((task) => !['success', 'copied', 'paused'].includes(task.status))} className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-amber-100 transition hover:bg-amber-500/12 disabled:opacity-40"><PauseCircle className="h-3.5 w-3.5" />暂停选中</button>
             <button type="button" onClick={() => void downloadSelectedResults(taskMenu.taskIds)} disabled={!hasResult} className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left transition hover:bg-white/[0.06] hover:text-white disabled:opacity-40"><Archive className="h-3.5 w-3.5" />下载结果</button>
             {menuTasks.length === 1 && <button type="button" onClick={() => downloadOriginalTask(menuTasks[0].id)} className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left transition hover:bg-white/[0.06] hover:text-white"><Download className="h-3.5 w-3.5" />下载原图</button>}
@@ -4666,221 +6073,321 @@ export default function ImageTranslator() {
         );
       })()}
 
+      {historyMenu && (() => {
+        const menuTasks = historyTasks.filter((task) => historyMenu.taskIds.includes(task.id));
+        if (menuTasks.length === 0) return null;
+        return (
+          <div
+            className="fixed z-[80] w-52 overflow-hidden rounded-2xl border border-white/10 bg-[#101211]/95 p-1 text-xs text-white/70 shadow-[0_20px_60px_rgba(0,0,0,0.65)] backdrop-blur-xl animate-in fade-in zoom-in-95"
+            style={{ left: Math.min(historyMenu.x, window.innerWidth - 220), top: Math.min(historyMenu.y, window.innerHeight - 180) }}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="px-3 py-2 text-[11px] text-white/42">已选 {menuTasks.length} 个项目</div>
+            <button type="button" onClick={() => void downloadHistoryTasks(historyMenu.taskIds)} className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left transition hover:bg-emerald-500/12 hover:text-white"><Archive className="h-3.5 w-3.5" />下载项目</button>
+            {menuTasks.length === 1 && <button type="button" onClick={() => void selectHistoryTask(menuTasks[0].id)} className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left transition hover:bg-white/[0.06] hover:text-white"><FolderOpen className="h-3.5 w-3.5" />查看详情</button>}
+            <div className="my-1 h-px bg-white/10" />
+            <button type="button" onClick={() => requestDeleteHistoryTasks(historyMenu.taskIds)} className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-red-200 transition hover:bg-red-500/12"><Trash2 className="h-3.5 w-3.5" />删除项目</button>
+          </div>
+        );
+      })()}
+
       {historyOpen && (
-        <div className="fixed inset-0 z-50 bg-black/90 p-1 text-white sm:p-3">
-          <div className="ui-history-shell flex h-full w-full flex-col overflow-hidden rounded-[28px] border border-white/10 shadow-[0_40px_120px_rgba(0,0,0,0.85)]">
-            <div className="border-b border-white/10 bg-[linear-gradient(135deg,rgba(182,242,20,0.08),rgba(255,255,255,0.025)_42%,rgba(94,234,212,0.06))] px-4 py-4">
-              <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+        <div
+          className="ui-history-modal-backdrop fixed inset-0 z-50 bg-black/92 p-1 text-white sm:p-3"
+          onWheelCapture={(event) => event.stopPropagation()}
+        >
+          <div ref={historyDialogRef} role="dialog" aria-modal="true" aria-labelledby="history-title" tabIndex={-1} className="ui-history-shell flex h-full w-full flex-col overflow-hidden rounded-[30px] border border-white/10 shadow-[0_40px_120px_rgba(0,0,0,0.85)]">
+            <div className="xobi-archive-hero border-b border-white/10 px-4 py-3 sm:px-5">
+              <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
                 <div className="min-w-0">
-                  <p className="text-[11px] uppercase tracking-[0.24em] text-emerald-200/55">xobi archive</p>
-                  <h2 className="mt-1 text-2xl font-semibold tracking-tight text-white">历史工作台</h2>
-                  <p className="mt-2 max-w-3xl truncate text-xs text-white/42" title={resourceDir}>资源目录：{resourceDir || 'E:\\图片翻译器\\资源'}</p>
+                  <p className="xobi-kicker text-emerald-200/58">xobi archive</p>
+                  <h2 id="history-title" className="mt-1 text-2xl font-semibold tracking-[-0.035em] text-white sm:text-[1.7rem]">历史工作台</h2>
+                  <p className="mt-1 max-w-4xl truncate text-xs text-white/42" title={resourceDir}>本地资源：{resourceDir || 'E:\\图片翻译器\\资源'}</p>
                 </div>
-                <div className="grid grid-cols-3 gap-2 text-center text-xs sm:min-w-[360px]">
-                  <div className="rounded-2xl border border-white/10 bg-black/28 px-4 py-3"><p className="text-white/36">任务</p><p className="mt-1 text-2xl font-semibold tabular-nums text-white">{historyTasks.length}</p></div>
-                  <div className="rounded-2xl border border-emerald-300/15 bg-emerald-400/10 px-4 py-3"><p className="text-emerald-100/55">完成</p><p className="mt-1 text-2xl font-semibold tabular-nums text-emerald-300">{historyTasks.reduce((sum, task) => sum + task.doneCount, 0)}</p></div>
-                  <div className="rounded-2xl border border-red-300/15 bg-red-400/10 px-4 py-3"><p className="text-red-100/55">失败</p><p className="mt-1 text-2xl font-semibold tabular-nums text-red-300">{historyTasks.reduce((sum, task) => sum + task.failCount, 0)}</p></div>
+                <div className="grid grid-cols-3 gap-2 text-left text-xs sm:min-w-[340px]">
+                  <div className="xobi-stat-tile"><p>任务</p><strong>{historyTotalCount || historyTasks.length}</strong></div>
+                  <div className="xobi-stat-tile xobi-stat-good"><p>完成</p><strong>{historyTasks.reduce((sum, task) => sum + task.doneCount, 0)}</strong></div>
+                  <div className="xobi-stat-tile xobi-stat-bad"><p>失败</p><strong>{historyTasks.reduce((sum, task) => sum + task.failCount, 0)}</strong></div>
                 </div>
                 <div className="flex items-center gap-2 xl:self-start">
-                  <button type="button" onClick={refreshHistory} disabled={historyLoading} className="inline-flex h-10 items-center gap-2 rounded-xl border border-white/10 bg-white/[0.06] px-3 text-xs font-medium text-white/68 transition hover:bg-white/[0.10] disabled:opacity-50"><RefreshCw className={cn('h-3.5 w-3.5', historyLoading && 'animate-spin')} />刷新</button>
-                  <button type="button" onClick={() => setHistoryOpen(false)} className="flex h-10 w-10 items-center justify-center rounded-xl border border-white/10 bg-white/[0.06] text-white/45 transition hover:bg-white/[0.10] hover:text-white"><X className="h-4 w-4" /></button>
+                  <button type="button" onClick={refreshHistory} disabled={historyLoading} className="xobi-soft-button h-10 px-3 text-xs"><RefreshCw className={cn('h-3.5 w-3.5', historyLoading && 'animate-spin')} />刷新</button>
+                  <button type="button" onClick={() => setHistoryOpen(false)} aria-label="关闭历史" className="xobi-icon-button h-10 w-10"><X className="h-4 w-4" /></button>
                 </div>
               </div>
             </div>
 
-            <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[360px_minmax(0,1fr)] 2xl:grid-cols-[360px_minmax(0,1fr)_320px]">
-              <aside className="min-h-0 overflow-auto border-b border-white/10 bg-black/30 p-3 lg:border-b-0 lg:border-r">
-                <div className="mb-3 flex items-center justify-between px-1">
-                  <span className="text-xs font-medium text-white/58">任务列表</span>
-                  <span className="rounded-full border border-white/10 bg-white/[0.04] px-2.5 py-1 text-[11px] text-white/40">{historyTasks.length}</span>
-                </div>
-
-                {historyTasks.length === 0 ? (
-                  <div className="flex min-h-64 items-center justify-center rounded-2xl border border-dashed border-white/10 px-4 text-center text-sm leading-6 text-white/38">暂无历史。上传图片后会立刻保存到资源目录。</div>
-                ) : (
-                  <div className="space-y-2.5">
-                    {historyTasks.map((task) => {
-                      const active = task.id === (selectedHistoryTask?.id ?? selectedHistoryTaskId);
-                      const percent = task.totalCount ? Math.round((task.doneCount / task.totalCount) * 100) : 0;
-                      return (
-                        <button key={task.id} type="button" onClick={() => void selectHistoryTask(task.id)} className={cn('group w-full overflow-hidden rounded-3xl border p-3 text-left transition', active ? 'border-emerald-300/40 bg-emerald-400/10 shadow-[0_0_28px_rgba(182,242,20,0.10)]' : 'border-white/10 bg-white/[0.032] hover:border-white/18 hover:bg-white/[0.06]')}>
-                          <div className="flex items-start justify-between gap-3">
-                            <div className="min-w-0">
-                              <p className="truncate text-sm font-semibold text-white/88">{task.name}</p>
-                              <p className="mt-1 text-[11px] text-white/32">{new Date(task.updatedAt).toLocaleString('zh-CN')}</p>
-                            </div>
-                            <span className={cn('shrink-0 rounded-full px-2 py-0.5 text-[10px]', task.status === 'done' ? 'bg-emerald-400/15 text-emerald-200' : task.status === 'failed' ? 'bg-red-400/15 text-red-200' : task.status === 'running' ? 'bg-cyan-400/15 text-cyan-100' : 'bg-amber-400/15 text-amber-100')}>{getHistoryStatusText(task.status)}</span>
-                          </div>
-                          <div className="mt-3 flex items-center gap-2">
-                            <div className="h-2 flex-1 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-gradient-to-r from-emerald-400 to-cyan-300" style={{ width: `${percent}%` }} /></div>
-                            <span className="w-10 text-right text-[11px] tabular-nums text-white/45">{percent}%</span>
-                          </div>
-                          <div className="mt-3 flex flex-wrap gap-1.5 text-[11px]">
-                            <span className="rounded-lg bg-white/[0.05] px-2 py-1 text-white/45">总 {task.totalCount}</span>
-                            <span className="rounded-lg bg-emerald-400/10 px-2 py-1 text-emerald-200">成 {task.doneCount}</span>
-                            {task.failCount > 0 && <span className="rounded-lg bg-red-400/10 px-2 py-1 text-red-200">败 {task.failCount}</span>}
-                            {task.copiedCount > 0 && <span className="rounded-lg bg-cyan-400/10 px-2 py-1 text-cyan-100">跳 {task.copiedCount}</span>}
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
-              </aside>
-
-              <section className="min-h-0 overflow-auto bg-black/10 p-4">
-                {selectedHistoryTask ? (
-                  !selectedHistoryDetailReady ? (
-                    <div className="flex min-h-full flex-col items-center justify-center rounded-2xl border border-dashed border-white/10 bg-white/[0.025] text-center">
-                      <RefreshCw className="h-5 w-5 animate-spin text-emerald-200" />
-                      <p className="mt-3 text-sm text-white/68">正在读取本地原图和结果预览...</p>
-                      <p className="mt-1 text-xs text-white/35">只要磁盘里有文件，这里会等完整详情回来再显示，避免误报原图缺失。</p>
+            <div className="min-h-0 flex-1 overflow-hidden">
+              {!selectedHistoryTaskId ? (
+                <section ref={historyGalleryRef} onMouseDown={beginHistorySelection} onClick={(event) => { if (selectionSuppressClickRef.current) { event.preventDefault(); return; } if (selectedHistoryTaskIdsRef.current.size > 0 && isBlankSelectionSurfaceClick(event, '[data-history-task-id],.xobi-history-selection-bar')) setSelectedHistoryTaskIdsIfChanged(new Set()); }} className="xobi-history-gallery-stage relative h-full overflow-auto p-2.5 sm:p-3">
+                  <div className="mb-3 flex items-center justify-between gap-3 px-1">
+                    <div className="min-w-0">
+                      <p className="text-xs font-semibold tracking-wide text-white/62">项目图库</p>
+                      <p className="mt-1 text-[11px] text-white/34">点开详情，拖拽框选，右键操作。</p>
                     </div>
+                    <div className="flex items-center gap-2">
+                      <span className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-[11px] tabular-nums text-white/46">{historyTotalCount || historyTasks.length} 个项目</span>
+                    </div>
+                  </div>
+                  {selectedHistoryTaskIds.size > 0 && (
+                    <div className="xobi-history-selection-bar">
+                      <span>已选 {selectedHistoryTaskIds.size}</span>
+                      <button type="button" onClick={() => void downloadHistoryTasks([...selectedHistoryTaskIds])}>下载</button>
+                      <button type="button" onClick={() => requestDeleteHistoryTasks([...selectedHistoryTaskIds])}>删除</button>
+                    </div>
+                  )}
+
+                  {historyTasks.length === 0 ? (
+                    <div className="xobi-empty-state min-h-[58vh]">暂无历史。上传图片后会自动保存在这里。</div>
                   ) : (
-                  <div className="space-y-4">
-                    <div className="rounded-3xl border border-white/10 bg-[linear-gradient(135deg,rgba(255,255,255,0.055),rgba(255,255,255,0.018))] p-4">
-                      <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
-                        <div className="min-w-0">
-                          <p className="text-[11px] uppercase tracking-[0.22em] text-emerald-200/45">detail</p>
-                          <h3 className="mt-1 truncate text-2xl font-semibold tracking-tight text-white">{selectedHistoryTask.name}</h3>
-                          <div className="mt-3 flex flex-wrap gap-2 text-xs"><span className="rounded-full border border-white/10 bg-white/[0.05] px-3 py-1 text-white/52">{selectedHistoryTask.language}</span><span className="rounded-full border border-white/10 bg-white/[0.05] px-3 py-1 text-white/52">{selectedHistoryTask.ratio}</span><span className="rounded-full border border-emerald-300/15 bg-emerald-400/10 px-3 py-1 text-emerald-200">{selectedHistoryTask.doneCount}/{selectedHistoryTask.totalCount}</span></div>
+                    <div className="xobi-history-masonry xobi-history-masonry-full">
+                      {historyTasks.map((task) => {
+                        const percent = task.totalCount ? Math.round((task.doneCount / task.totalCount) * 100) : 0;
+                        const previews = getHistoryPreviewImages(task);
+                        const cover = previews[0];
+                        const thumbs = previews.slice(1, 4);
+                        return (
+                          <button key={task.id} type="button" data-history-task-id={task.id} aria-pressed={selectedHistoryTaskIds.has(task.id)} onClick={(event) => toggleHistoryTaskSelection(task.id, event)} onContextMenu={(event) => openHistoryMenu(event, task.id)} className={cn('xobi-history-card xobi-history-gallery-card group', selectedHistoryTaskIds.has(task.id) && 'xobi-history-card-active xobi-history-card-selected')}>
+                            <div className="xobi-history-cover">
+                              {cover?.dataUrl ? <LocalPreviewImage src={cover.dataUrl} alt={cover.name} className="p-2" /> : <div className="xobi-history-cover-empty"><ImageIcon className="h-7 w-7" /><span>暂无预览</span></div>}
+                            </div>
+                            <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                              <span className={cn('xobi-cover-kind', cover?.kind === 'result' ? 'xobi-cover-result' : 'xobi-cover-original')}>{cover?.kind === 'result' ? '结果封面' : '原图封面'}</span>
+                              <span className={cn('xobi-status-pill xobi-cover-status', task.status === 'done' ? 'xobi-status-done' : task.status === 'failed' ? 'xobi-status-failed' : task.status === 'running' ? 'xobi-status-running' : 'xobi-status-partial')}>{getHistoryStatusText(task.status)}</span>
+                            </div>
+
+                            <div className="mt-2.5 grid grid-cols-3 gap-1.5">
+                              {thumbs.length > 0 ? thumbs.map((preview) => (
+                                <div key={`${task.id}-${preview.id}-${preview.kind}`} className="xobi-history-thumb">
+                                  {preview.dataUrl && <LocalPreviewImage src={preview.dataUrl} alt={preview.name} className="p-1" />}
+                                </div>
+                              )) : Array.from({ length: 3 }).map((_, index) => <div key={`${task.id}-empty-${index}`} className="xobi-history-thumb xobi-history-thumb-empty" />)}
+                            </div>
+
+                            <div className="mt-2.5 flex items-start justify-between gap-3">
+                              <div className="min-w-0 text-left">
+                                <p className="truncate text-[13px] font-semibold text-white/92">{task.name}</p>
+                                <p className="mt-1 text-[10px] tabular-nums text-white/34">{new Date(task.updatedAt).toLocaleString('zh-CN')}</p>
+                              </div>
+                              <span className="text-right text-base font-semibold leading-none tabular-nums text-emerald-200">{percent}%</span>
+                            </div>
+
+                            <div className="mt-2.5 h-1.5 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-gradient-to-r from-emerald-400 to-cyan-300" style={{ width: `${percent}%` }} /></div>
+                            <div className="mt-2.5 grid grid-cols-3 gap-1.5 text-[10px]">
+                              <span className="xobi-mini-chip">总 {task.totalCount}</span>
+                              <span className="xobi-mini-chip text-emerald-200">成 {task.doneCount}</span>
+                              <span className={cn('xobi-mini-chip', task.failCount > 0 ? 'text-red-200' : 'text-white/35')}>败 {task.failCount}</span>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                  {historyHasMore && (
+                    <div className="mt-4 flex justify-center">
+                      <button type="button" onClick={() => void loadMoreHistoryTasks()} disabled={historyLoading} className="xobi-soft-button min-h-11 px-5 text-sm">
+                        {historyLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                        加载更多历史
+                      </button>
+                    </div>
+                  )}
+                </section>
+              ) : (
+                <div className="xobi-history-detail-view grid h-full min-h-0 grid-cols-1 lg:grid-cols-[minmax(0,1fr)_320px]">
+                  <section className="min-h-0 overflow-auto bg-[radial-gradient(circle_at_20%_0%,rgba(16,185,129,0.08),transparent_30%),rgba(255,255,255,0.015)] p-4">
+                    <button type="button" onClick={() => setSelectedHistoryTaskId(null)} className="xobi-soft-button mb-3 h-10 px-3 text-xs">返回图库</button>
+                    {selectedHistoryTask ? (
+                      !selectedHistoryDetailReady ? (
+                        <div className="xobi-empty-state min-h-full">
+                          <RefreshCw className="h-5 w-5 animate-spin text-emerald-200" />
+                          <p className="mt-3 text-sm text-white/72">正在读取本地预览...</p>
                         </div>
-                        <div className="flex flex-wrap gap-2">
-                          <button type="button" onClick={() => restoreHistoryTask(selectedHistoryTask.id)} disabled={historyLoading} className="inline-flex h-10 items-center gap-2 rounded-xl bg-emerald-400 px-4 text-sm font-semibold text-black transition hover:bg-emerald-300 disabled:opacity-50"><FolderOpen className="h-4 w-4" />恢复/继续</button>
-                          <button type="button" onClick={() => deleteHistoryTask(selectedHistoryTask.id)} disabled={historyLoading} className="inline-flex h-10 items-center gap-2 rounded-xl border border-red-400/25 bg-red-400/10 px-4 text-sm font-medium text-red-200 transition hover:bg-red-400/15 disabled:opacity-50"><Trash2 className="h-4 w-4" />删除</button>
+                      ) : (
+                        <div className="space-y-4">
+                          <div className="xobi-detail-plate">
+                            <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+                              <div className="min-w-0">
+                                <p className="xobi-kicker text-emerald-200/48">detail</p>
+                                <h3 className="mt-1 truncate text-2xl font-semibold tracking-[-0.035em] text-white">{selectedHistoryTask.name}</h3>
+                                <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                                  <span className="xobi-mini-chip">{selectedHistoryTask.language}</span>
+                                  <span className="xobi-mini-chip">{selectedHistoryTask.ratio}</span>
+                                  <span className="xobi-mini-chip text-emerald-200">{selectedHistoryTask.doneCount}/{selectedHistoryTask.totalCount}</span>
+                                </div>
+                              </div>
+                              <div className="flex flex-wrap gap-2">
+                                <button type="button" onClick={() => restoreHistoryTask(selectedHistoryTask.id)} disabled={historyLoading} className="xobi-primary-action h-10 px-4 text-sm"><FolderOpen className="h-4 w-4" />恢复/继续</button>
+                                <button type="button" onClick={() => requestDeleteHistoryTask(selectedHistoryTask.id)} disabled={historyLoading} className="xobi-danger-action h-10 px-4 text-sm"><Trash2 className="h-4 w-4" />删除</button>
+                              </div>
+                            </div>
+                            <div className="ui-progress-rail mt-4 h-2 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-gradient-to-r from-emerald-400 to-cyan-300" style={{ width: `${historyDonePercent}%` }} /></div>
+                          </div>
+
+                          <div className="grid gap-3 [grid-template-columns:repeat(auto-fill,minmax(min(100%,280px),1fr))]">
+                            {selectedHistoryTask.images.map((image) => (
+                              <div key={image.id} className="xobi-history-image-card">
+                                <div className="flex items-start justify-between gap-2">
+                                  <div className="min-w-0">
+                                    <p className="truncate text-sm font-semibold text-white/86" title={image.relativePath}>{image.name}</p>
+                                    <p className="mt-1 truncate text-[11px] text-white/30" title={image.outputRelativePath}>{image.outputRelativePath}</p>
+                                  </div>
+                                  <span className="xobi-status-pill xobi-status-partial">{getTaskStatusText(image.status)}</span>
+                                </div>
+
+                                <div className="mt-3 grid grid-cols-2 gap-2">
+                                  <div className="ui-preview-pane relative aspect-square overflow-hidden rounded-2xl border border-white/10">
+                                    <span className="absolute left-2 top-2 z-10 rounded-md bg-black/70 px-1.5 py-0.5 text-[9px] text-white/55">原图</span>
+                                    {image.originalDataUrl ? <LocalPreviewImage src={image.originalDataUrl} alt={image.name} className="p-3" /> : <div className="flex h-full items-center justify-center text-[11px] text-red-200">{image.originalPath ? '读取失败' : '原图缺失'}</div>}
+                                  </div>
+                                  <div className="ui-preview-pane ui-preview-result relative aspect-square overflow-hidden rounded-2xl border border-white/10">
+                                    <span className="absolute left-2 top-2 z-10 rounded-md bg-emerald-500/80 px-1.5 py-0.5 text-[9px] text-black">结果</span>
+                                    {image.resultDataUrl ? <LocalPreviewImage src={image.resultDataUrl} alt={`${image.name} result`} className="p-3" /> : <div className="flex h-full items-center justify-center text-[11px] text-white/30">未生成</div>}
+                                  </div>
+                                </div>
+
+                                <div className="mt-3 grid grid-cols-2 gap-2 text-[11px]">
+                                  <span className={cn('xobi-save-pill', image.originalPath ? 'text-emerald-200' : 'text-red-200')}>原图 {image.originalPath ? '已保存' : '缺失'}</span>
+                                  <span className={cn('xobi-save-pill', image.resultPath ? 'text-emerald-200' : 'text-white/35')}>结果 {image.resultPath ? '已保存' : '未生成'}</span>
+                                </div>
+
+                                <div className="mt-3 grid grid-cols-2 gap-2">
+                                  <button type="button" onClick={() => restoreHistoryImageForReprocess(image, 'translate')} disabled={historyLoading || !image.originalDataUrl} className="xobi-soft-button h-9 justify-center text-xs text-emerald-100"><RefreshCw className="h-3.5 w-3.5" />重翻</button>
+                                  <button type="button" onClick={() => restoreHistoryImageForReprocess(image, 'redraw')} disabled={historyLoading || !image.originalDataUrl || !image.translatedText} className="xobi-soft-button h-9 justify-center text-xs text-cyan-100"><Sparkles className="h-3.5 w-3.5" />重绘</button>
+                                  <button type="button" onClick={() => downloadHistoryImage(image, 'original')} disabled={!image.originalDataUrl} className="xobi-soft-button h-9 justify-center text-xs"><Download className="h-3.5 w-3.5" />原图</button>
+                                  <button type="button" onClick={() => downloadHistoryImage(image, 'result')} disabled={!image.resultDataUrl} className="xobi-soft-button h-9 justify-center text-xs"><Archive className="h-3.5 w-3.5" />结果</button>
+                                </div>
+
+                                <button type="button" onClick={() => requestDeleteHistoryImage(image)} disabled={historyLoading} className="xobi-danger-action mt-2 h-8 w-full justify-center text-xs"><Trash2 className="h-3.5 w-3.5" />删除这张</button>
+                                {image.error && <p className="mt-2 line-clamp-2 text-[11px] leading-5 text-red-200">{image.error}</p>}
+                              </div>
+                            ))}
+                          </div>
+                          {historyDetailHasMore && (
+                            <div className="flex justify-center">
+                              <button type="button" onClick={() => void loadMoreHistoryTaskImages()} disabled={historyDetailLoadingMore} className="xobi-soft-button min-h-11 px-5 text-sm">
+                                {historyDetailLoadingMore ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                                继续加载历史图片
+                              </button>
+                            </div>
+                          )}
                         </div>
+                      )
+                    ) : (
+                      <div className="xobi-empty-state min-h-full">这个历史任务不存在，返回图库重新选。</div>
+                    )}
+                  </section>
+
+                  <aside className="min-h-0 overflow-auto border-t border-white/10 bg-black/28 p-4 lg:border-l lg:border-t-0">
+                    <p className="xobi-kicker text-white/28">local log</p>
+                    <div className="mt-3 rounded-2xl border border-white/10 bg-black/35 p-3">
+                      <div className="grid grid-cols-2 gap-2 text-center text-xs">
+                        <div className="rounded-xl bg-white/[0.05] p-3"><p className="text-white/35">本地任务</p><p className="mt-1 text-xl font-semibold tabular-nums">{selectedHistoryTask?.totalCount ?? 0}</p></div>
+                        <div className="rounded-xl bg-white/[0.05] p-3"><p className="text-white/35">保存进度</p><p className="mt-1 text-xl font-semibold tabular-nums text-emerald-300">{historyDonePercent}%</p></div>
                       </div>
-                      <div className="ui-progress-rail mt-4 h-2 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-gradient-to-r from-emerald-400 to-cyan-300" style={{ width: `${historyDonePercent}%` }} /></div>
+                      <p className="mt-3 break-all text-[11px] leading-5 text-white/36">{selectedHistoryTask ? `任务 ID：${selectedHistoryTask.id}` : '未选择任务'}</p>
                     </div>
-
-                    <div className="grid justify-start gap-4 [grid-template-columns:repeat(auto-fill,minmax(320px,380px))]">
-                      {selectedHistoryTask.images.map((image) => (
-                        <div key={image.id} className="rounded-3xl border border-white/10 bg-black/25 p-3 transition hover:border-white/18 hover:bg-white/[0.04]">
-                          <div className="flex items-start justify-between gap-2">
-                            <div className="min-w-0">
-                              <p className="truncate text-sm font-medium text-white/82" title={image.relativePath}>{image.name}</p>
-                              <p className="mt-1 truncate text-[11px] text-white/28" title={image.outputRelativePath}>{image.outputRelativePath}</p>
-                            </div>
-                            <span className="shrink-0 rounded-full bg-white/[0.07] px-2 py-0.5 text-[10px] text-white/52">{getTaskStatusText(image.status)}</span>
-                          </div>
-
-                          <div className="mt-3 grid grid-cols-2 gap-2">
-                            <div className="ui-preview-pane relative aspect-square overflow-hidden rounded-2xl border border-white/10">
-                              <span className="absolute left-2 top-2 z-10 rounded-md bg-black/70 px-1.5 py-0.5 text-[9px] text-white/55">原图</span>
-                              {image.originalDataUrl ? <Image src={image.originalDataUrl} alt={image.name} fill unoptimized className="object-contain p-3" /> : <div className="flex h-full items-center justify-center text-[11px] text-red-200">{image.originalPath ? '文件读取失败' : '原图缺失'}</div>}
-                            </div>
-                            <div className="ui-preview-pane ui-preview-result relative aspect-square overflow-hidden rounded-2xl border border-white/10">
-                              <span className="absolute left-2 top-2 z-10 rounded-md bg-emerald-500/80 px-1.5 py-0.5 text-[9px] text-black">结果</span>
-                              {image.resultDataUrl ? <Image src={image.resultDataUrl} alt={`${image.name} result`} fill unoptimized className="object-contain p-3" /> : <div className="flex h-full items-center justify-center text-[11px] text-white/30">未生成</div>}
-                            </div>
-                          </div>
-
-                          <div className="mt-3 grid grid-cols-2 gap-2 text-[11px]">
-                            <span className={cn('rounded-xl px-2 py-1.5 text-center', image.originalPath ? 'bg-emerald-400/10 text-emerald-200' : 'bg-red-400/10 text-red-200')}>原图 {image.originalPath ? '已保存' : '缺失'}</span>
-                            <span className={cn('rounded-xl px-2 py-1.5 text-center', image.resultPath ? 'bg-emerald-400/10 text-emerald-200' : 'bg-white/[0.05] text-white/35')}>结果 {image.resultPath ? '已保存' : '未生成'}</span>
-                          </div>
-
-                          <div className="mt-3 grid grid-cols-2 gap-2">
-                            <button type="button" onClick={() => restoreHistoryImageForReprocess(image, 'translate')} disabled={historyLoading || !image.originalDataUrl} className="inline-flex h-9 items-center justify-center gap-1.5 rounded-xl border border-emerald-400/20 bg-emerald-500/10 px-2 text-xs font-medium text-emerald-100 transition hover:bg-emerald-500/15 disabled:opacity-40"><RefreshCw className="h-3.5 w-3.5" />单图重翻</button>
-                            <button type="button" onClick={() => restoreHistoryImageForReprocess(image, 'redraw')} disabled={historyLoading || !image.originalDataUrl || !image.translatedText} className="inline-flex h-9 items-center justify-center gap-1.5 rounded-xl border border-cyan-400/20 bg-cyan-500/10 px-2 text-xs font-medium text-cyan-100 transition hover:bg-cyan-500/15 disabled:opacity-40"><Sparkles className="h-3.5 w-3.5" />单图重绘</button>
-                            <button type="button" onClick={() => downloadHistoryImage(image, 'original')} disabled={!image.originalDataUrl} className="inline-flex h-9 items-center justify-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.05] px-2 text-xs text-white/62 transition hover:bg-white/[0.09] disabled:opacity-40"><Download className="h-3.5 w-3.5" />原图</button>
-                            <button type="button" onClick={() => downloadHistoryImage(image, 'result')} disabled={!image.resultDataUrl} className="inline-flex h-9 items-center justify-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.05] px-2 text-xs text-white/62 transition hover:bg-white/[0.09] disabled:opacity-40"><Archive className="h-3.5 w-3.5" />结果</button>
-                          </div>
-
-                          <button type="button" onClick={() => void deleteHistoryImage(image)} disabled={historyLoading} className="mt-2 inline-flex h-8 w-full items-center justify-center gap-1.5 rounded-xl border border-red-400/15 bg-red-500/10 px-2 text-xs text-red-200 transition hover:bg-red-500/15 disabled:opacity-40"><Trash2 className="h-3.5 w-3.5" />从历史和本地删除这张</button>
-                          {image.error && <p className="mt-2 line-clamp-2 text-[11px] leading-5 text-red-200">{image.error}</p>}
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                  )
-                ) : (
-                  <div className="flex min-h-full items-center justify-center rounded-2xl border border-dashed border-white/10 text-sm text-white/35">选择左侧历史任务查看详情。</div>
-                )}
-              </section>
-
-              <aside className="min-h-0 overflow-auto border-t border-white/10 bg-black/25 p-4 lg:col-span-2 2xl:col-span-1 2xl:border-l 2xl:border-t-0">
-                <p className="text-[11px] uppercase tracking-[0.22em] text-white/25">Local Log</p>
-                <div className="mt-3 rounded-2xl border border-white/10 bg-black/35 p-3">
-                  <div className="grid grid-cols-2 gap-2 text-center text-xs">
-                    <div className="rounded-xl bg-white/[0.05] p-3"><p className="text-white/35">本地任务</p><p className="mt-1 text-xl font-semibold tabular-nums">{selectedHistoryTask?.totalCount ?? 0}</p></div>
-                    <div className="rounded-xl bg-white/[0.05] p-3"><p className="text-white/35">保存进度</p><p className="mt-1 text-xl font-semibold tabular-nums text-emerald-300">{historyDonePercent}%</p></div>
-                  </div>
-                  <p className="mt-3 break-all text-[11px] leading-5 text-white/36">{selectedHistoryTask ? `任务 ID：${selectedHistoryTask.id}` : '未选择任务'}</p>
+                    <pre className="mt-3 max-h-[48vh] overflow-auto rounded-2xl border border-white/10 bg-black/48 p-3 text-[11px] leading-5 text-white/42">{selectedHistoryLogs || '选择一个历史任务后显示本地写入日志。'}</pre>
+                  </aside>
                 </div>
-                <pre className="mt-3 max-h-[48vh] overflow-auto rounded-2xl border border-white/10 bg-black/45 p-3 text-[11px] leading-5 text-white/42">{selectedHistoryLogs || '选择一个历史任务后显示本地写入日志。'}</pre>
-              </aside>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {confirmDialog && (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/78 px-4 text-white backdrop-blur-xl" onMouseDown={(event) => { if (event.target === event.currentTarget) closeConfirmDialog(); }}>
+          <div ref={confirmDialogRef} role="dialog" aria-modal="true" aria-labelledby="xobi-confirm-title" aria-describedby="xobi-confirm-message" tabIndex={-1} className="ui-modal-panel w-full max-w-md overflow-hidden rounded-[26px] border border-white/10 bg-[#111214] shadow-[0_28px_90px_rgba(0,0,0,0.78)]">
+            <div className="px-5 py-5">
+              <p className={cn('text-[11px] uppercase tracking-[0.22em]', confirmDialog.tone === 'danger' ? 'text-red-200/70' : 'text-emerald-200/55')}>Confirm</p>
+              <h2 id="xobi-confirm-title" className="mt-1 text-lg font-semibold text-white">{confirmDialog.title}</h2>
+              <p id="xobi-confirm-message" className="mt-2 text-sm leading-6 text-white/52">{confirmDialog.message}</p>
+            </div>
+            <div className="flex flex-col-reverse gap-2 border-t border-white/10 bg-black/32 px-5 py-4 sm:flex-row sm:justify-end">
+              <button type="button" onClick={closeConfirmDialog} disabled={isConfirming} className="rounded-xl border border-white/10 px-4 py-2 text-sm text-white/58 transition hover:bg-white/[0.06] hover:text-white disabled:opacity-45">{confirmDialog.cancelLabel ?? '取消'}</button>
+              <button type="button" onClick={() => void runConfirmDialogAction()} disabled={isConfirming} className={cn('inline-flex items-center justify-center gap-2 rounded-xl px-5 py-2 text-sm font-semibold transition disabled:opacity-55', confirmDialog.tone === 'danger' ? 'border border-red-300/20 bg-red-500/88 text-white hover:bg-red-400' : 'ui-button ui-button-primary text-black')}>
+                {isConfirming && <Loader2 className="h-4 w-4 animate-spin" />}
+                {confirmDialog.confirmLabel}
+              </button>
             </div>
           </div>
         </div>
       )}
 
       {settingsOpen && (
-        <div className="ui-modal-backdrop fixed inset-0 z-50 flex items-center justify-center px-4 py-8 backdrop-blur-xl" onMouseDown={(event) => { if (event.target === event.currentTarget) closeSettings(); }}>
-          <form ref={settingsDialogRef} role="dialog" onSubmit={(event) => { event.preventDefault(); handleSaveSettings(); }} aria-modal="true" aria-labelledby="settings-title" className="ui-modal-panel max-h-[92vh] w-full max-w-[min(96vw,1040px)] overflow-auto rounded-[18px] border border-white/10 shadow-[0_28px_80px_rgba(0,0,0,0.75)]">
-            <div className="flex items-start justify-between gap-4 border-b border-white/10 bg-black/55 px-5 py-4">
-              <div className="space-y-1">
-                <h2 id="settings-title" className="text-base font-semibold text-white">模型与连接设置</h2>
-                <p className="text-xs leading-5 text-white/55">常用只填 Base URL、秘钥和模型名。高级 JSON 会按原样发送。</p>
+        <div className="ui-modal-backdrop fixed inset-0 z-50 flex items-center justify-center px-3 py-5 backdrop-blur-xl sm:px-4 sm:py-8" onMouseDown={(event) => { if (event.target === event.currentTarget) closeSettings(); }}>
+          <form ref={settingsDialogRef} role="dialog" onSubmit={(event) => { event.preventDefault(); handleSaveSettings(); }} aria-modal="true" aria-labelledby="settings-title" tabIndex={-1} className="ui-modal-panel xobi-settings-modal max-h-[92vh] w-full max-w-[min(96vw,1080px)] overflow-hidden rounded-[26px] border border-white/10 shadow-[0_28px_80px_rgba(0,0,0,0.75)]">
+            <div className="xobi-settings-head flex items-start justify-between gap-4 border-b border-white/10 px-5 py-4">
+              <div className="min-w-0">
+                <p className="xobi-kicker text-emerald-200/52">settings</p>
+                <h2 id="settings-title" className="mt-1 text-xl font-semibold tracking-[-0.03em] text-white">模型与连接设置</h2>
+                <p className="mt-1 text-xs leading-5 text-white/50">常用只填 Base URL、秘钥和模型名；高级 JSON 不懂就别动。</p>
               </div>
-              <button type="button" onClick={closeSettings} aria-label="关闭设置" className="flex h-9 w-9 items-center justify-center rounded-lg text-white/60 transition hover:bg-white/10 hover:text-white"><X className="h-4 w-4" /></button>
+              <button type="button" onClick={closeSettings} aria-label="关闭设置" className="xobi-icon-button h-10 w-10"><X className="h-4 w-4" /></button>
             </div>
 
-            <div className="space-y-4 px-5 py-5">
-              <div className="ui-panel rounded-2xl border border-white/10 p-4">
-                <div className="mb-4 flex items-center justify-between gap-3">
-                  <div><p className="text-[11px] uppercase tracking-[0.2em] text-white/45">Basic</p><p className="mt-1 text-xs text-white/58">第三方 API 这里填完就能跑。</p></div>
-                  <div className="inline-grid h-8 min-w-[78px] grid-cols-[auto_1fr] items-center gap-1 rounded-full border border-emerald-400/25 bg-emerald-500/10 px-3 text-[11px] text-emerald-200"><span>并发</span><span className="text-right font-semibold tabular-nums">{draftSettings.maxParallelTasks || 1}</span></div>
+            <div className="xobi-settings-scroll max-h-[calc(92vh-148px)] space-y-4 overflow-auto px-5 py-5">
+              <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_260px]">
+                <div className="ui-panel xobi-settings-card rounded-3xl border border-white/10 p-4">
+                  <div className="mb-4 flex items-center justify-between gap-3">
+                    <div><p className="xobi-kicker text-white/42">Basic</p><p className="mt-1 text-xs text-white/55">这几个填好就能跑。</p></div>
+                    <div className="inline-flex h-8 items-center gap-2 rounded-full border border-emerald-400/25 bg-emerald-500/10 px-3 text-[11px] text-emerald-200"><span>并发</span><span className="tabular-nums">{draftSettings.maxParallelTasks}</span></div>
+                  </div>
+
+                  <div className="grid gap-4">
+                    <label className="xobi-field">
+                      <span><Globe className="h-3.5 w-3.5 text-white/35" />API Base URL</span>
+                      <input id="api-base-url-input" name="apiBaseUrl" value={draftSettings.apiBaseUrl} onChange={(event) => updateDraftSettings('apiBaseUrl', event.target.value)} placeholder="https://yunwu.ai/v1" className="xobi-input" />
+                    </label>
+
+                    <label className="xobi-field">
+                      <span>API 秘钥</span>
+                      <input id="api-key-input" name="apiKey" type="password" value={getBearerApiKeyFromHeaders(draftSettings.requestHeadersText)} onChange={(event) => updateDraftSettings('requestHeadersText', applyBearerApiKeyToHeaders(draftSettings.requestHeadersText, event.target.value))} placeholder="sk-..." autoComplete="off" className="xobi-input" />
+                      <p>只保存在这台电脑的当前浏览器里；不会写入历史，也不会跟项目代码一起分享。</p>
+                    </label>
+
+                    <div className="grid gap-4 md:grid-cols-2">
+                      <label className="xobi-field"><span>文本模型</span><input id="text-model-input" name="textModel" value={draftSettings.textModel} onChange={(event) => updateDraftSettings('textModel', event.target.value)} placeholder="gemini-3.1-flash-lite-preview" className="xobi-input" /></label>
+                      <label className="xobi-field"><span>生图模型</span><input id="image-model-input" name="imageModel" value={draftSettings.imageModel} onChange={(event) => updateDraftSettings('imageModel', event.target.value)} placeholder="gemini-3.1-flash-image-preview" className="xobi-input" /></label>
+                    </div>
+                  </div>
                 </div>
 
-                <label className="space-y-2">
-                  <span className="flex items-center gap-2 text-xs font-medium text-white/65"><Globe className="h-3.5 w-3.5 text-white/35" />API Base URL</span>
-                  <input id="api-base-url-input" name="apiBaseUrl" value={draftSettings.apiBaseUrl} onChange={(event) => updateDraftSettings('apiBaseUrl', event.target.value)} placeholder="https://yunwu.ai/v1" className="w-full rounded-xl border border-white/10 bg-[#1a1a1a] px-3 py-2.5 text-sm text-white outline-none transition placeholder:text-white/18 hover:border-white/18 focus:border-emerald-400" />
-                </label>
-
-                <label className="mt-4 block space-y-2">
-                  <span className="text-xs font-medium text-white/65">API 秘钥</span>
-                  <input id="api-key-input" name="apiKey" type="password" value={getBearerApiKeyFromHeaders(draftSettings.requestHeadersText)} onChange={(event) => updateDraftSettings('requestHeadersText', applyBearerApiKeyToHeaders(draftSettings.requestHeadersText, event.target.value))} placeholder="sk-..." autoComplete="off" className="w-full rounded-xl border border-white/10 bg-[#1a1a1a] px-3 py-2.5 text-sm text-white outline-none transition placeholder:text-white/18 hover:border-white/18 focus:border-emerald-400" />
-                  <p className="text-[11px] leading-5 text-white/55">为了下次打开方便，秘钥会保存在这台电脑的当前浏览器里；不会写入历史记录，也不会跟项目代码一起分享。</p>
-                </label>
-
-                <div className="mt-4 grid gap-4 md:grid-cols-2">
-                  <label className="space-y-2"><span className="text-xs font-medium text-white/65">文本模型</span><input id="text-model-input" name="textModel" value={draftSettings.textModel} onChange={(event) => updateDraftSettings('textModel', event.target.value)} placeholder="gemini-3.1-flash-lite-preview" className="w-full rounded-xl border border-white/10 bg-[#1a1a1a] px-3 py-2.5 text-sm text-white outline-none transition placeholder:text-white/18 hover:border-white/18 focus:border-emerald-400" /></label>
-                  <label className="space-y-2"><span className="text-xs font-medium text-white/65">生图模型</span><input id="image-model-input" name="imageModel" value={draftSettings.imageModel} onChange={(event) => updateDraftSettings('imageModel', event.target.value)} placeholder="gemini-3.1-flash-image-preview" className="w-full rounded-xl border border-white/10 bg-[#1a1a1a] px-3 py-2.5 text-sm text-white outline-none transition placeholder:text-white/18 hover:border-white/18 focus:border-emerald-400" /></label>
-                </div>
-
-                <div className="mt-4 grid gap-4 md:grid-cols-2">
-                  <label className="grid gap-2"><span className="text-xs font-medium text-white/65">最大并发任务数</span><input id="max-parallel-tasks-input" name="maxParallelTasks" type="number" min={1} max={20} value={draftSettings.maxParallelTasks} onChange={(event) => updateDraftSettings('maxParallelTasks', Number(event.target.value || 1))} className="h-10 w-full rounded-xl border border-white/10 bg-[#1a1a1a] px-3 text-right text-sm tabular-nums text-white outline-none transition hover:border-white/18 focus:border-emerald-400" /></label>
-                  <label className="grid gap-2"><span className="text-xs font-medium text-white/65">生图超时毫秒</span><input id="image-timeout-input" name="imageRequestTimeoutMs" type="number" min={1000} step={1000} value={draftSettings.imageRequestTimeoutMs} onChange={(event) => updateDraftSettings('imageRequestTimeoutMs', Number(event.target.value || 1000))} className="h-10 w-full rounded-xl border border-white/10 bg-[#1a1a1a] px-3 text-right text-sm tabular-nums text-white outline-none transition hover:border-white/18 focus:border-emerald-400" /></label>
+                <div className="ui-panel xobi-settings-card rounded-3xl border border-white/10 p-4">
+                  <div className="mb-4"><p className="xobi-kicker text-white/42">Runtime</p><p className="mt-1 text-xs text-white/55">速度和稳定性的平衡。</p></div>
+                  <div className="grid gap-3">
+                    <label className="xobi-number-field"><span>最大并发</span><input id="max-parallel-tasks-input" name="maxParallelTasks" type="number" min={1} max={20} value={draftSettings.maxParallelTasks} onChange={(event) => updateDraftSettings('maxParallelTasks', Number(event.target.value || 1))} className="xobi-input text-right tabular-nums" /></label>
+                    <label className="xobi-number-field"><span>生图超时</span><input id="image-timeout-input" name="imageRequestTimeoutMs" type="number" min={1000} step={1000} value={draftSettings.imageRequestTimeoutMs} onChange={(event) => updateDraftSettings('imageRequestTimeoutMs', Number(event.target.value || 1000))} className="xobi-input text-right tabular-nums" /></label>
+                    <p className="rounded-2xl border border-amber-300/15 bg-amber-400/10 px-3 py-2 text-[11px] leading-5 text-amber-100/75">如果上游慢，先加超时，不要盲目拉高并发。</p>
+                  </div>
                 </div>
               </div>
 
-              <div className="ui-panel rounded-2xl border border-white/10 p-4">
-                <div className="mb-4"><p className="text-[11px] uppercase tracking-[0.2em] text-white/45">Raw Request</p><p className="mt-1 text-xs text-white/58">不懂就不用改；你填什么就发什么。</p></div>
+              <div className="ui-panel xobi-settings-card rounded-3xl border border-white/10 p-4">
+                <div className="mb-4"><p className="xobi-kicker text-white/42">Raw Request</p><p className="mt-1 text-xs text-white/55">高级区：你填什么，就原样发什么。</p></div>
                 <div className="grid gap-4 md:grid-cols-2">
-                  <label className="space-y-2"><span className="text-xs font-medium text-white/65">请求头 JSON</span><textarea id="request-headers-input" name="requestHeadersText" value={draftSettings.requestHeadersText} onChange={(event) => updateDraftSettings('requestHeadersText', event.target.value)} rows={6} placeholder={'{"Authorization":"Bearer xxx","x-api-key":"value"}'} className="w-full rounded-xl border border-white/10 bg-[#1a1a1a] px-3 py-2.5 font-mono text-xs text-white outline-none transition placeholder:text-white/18 hover:border-white/18 focus:border-emerald-400" /><p className="text-[11px] leading-5 text-white/52">这里填什么请求头，就原样发什么。必须是 JSON 对象。</p></label>
-                  <label className="space-y-2"><span className="text-xs font-medium text-white/65">URL 参数 JSON</span><textarea id="request-query-input" name="requestQueryParamsText" value={draftSettings.requestQueryParamsText} onChange={(event) => updateDraftSettings('requestQueryParamsText', event.target.value)} rows={6} placeholder={'{"key":"value"}'} className="w-full rounded-xl border border-white/10 bg-[#1a1a1a] px-3 py-2.5 font-mono text-xs text-white outline-none transition placeholder:text-white/18 hover:border-white/18 focus:border-emerald-400" /><p className="text-[11px] leading-5 text-white/52">这里填什么 URL 参数，就原样拼到请求地址上。必须是 JSON 对象。</p></label>
+                  <label className="xobi-field"><span>请求头 JSON</span><textarea id="request-headers-input" name="requestHeadersText" value={draftSettings.requestHeadersText} onChange={(event) => updateDraftSettings('requestHeadersText', event.target.value)} rows={6} placeholder={'{"Authorization":"Bearer xxx","x-api-key":"value"}'} className="xobi-input min-h-36 font-mono text-xs" /><p>必须是 JSON 对象。</p></label>
+                  <label className="xobi-field"><span>URL 参数 JSON</span><textarea id="request-query-input" name="requestQueryParamsText" value={draftSettings.requestQueryParamsText} onChange={(event) => updateDraftSettings('requestQueryParamsText', event.target.value)} rows={6} placeholder={'{"key":"value"}'} className="xobi-input min-h-36 font-mono text-xs" /><p>会拼到请求地址上，必须是 JSON 对象。</p></label>
                 </div>
               </div>
 
-              {settingsError && <div className="rounded-xl border border-red-400/25 bg-red-500/10 px-4 py-3 text-sm text-red-200">{settingsError}</div>}
+              {settingsError && <div className="xobi-message xobi-message-error">{settingsError}</div>}
               {connectionStatus !== 'idle' && (
-                <div className={cn('rounded-xl border px-4 py-3 text-sm', connectionStatus === 'success' && 'border-emerald-400/25 bg-emerald-500/10 text-emerald-200', connectionStatus === 'error' && 'border-red-400/25 bg-red-500/10 text-red-200', connectionStatus === 'testing' && 'border-emerald-400/25 bg-emerald-500/10 text-emerald-200')}>
-                  <div className="flex items-center gap-2">{connectionStatus === 'testing' && <Loader2 className="h-4 w-4 animate-spin" />}{connectionStatus === 'success' && <CheckCircle2 className="h-4 w-4" />}{connectionStatus === 'error' && <XCircle className="h-4 w-4" />}<span>{connectionMessage}</span></div>
+                <div className={cn('xobi-message', connectionStatus === 'success' && 'xobi-message-success', connectionStatus === 'error' && 'xobi-message-error', connectionStatus === 'testing' && 'xobi-message-success')}>
+                  <div className="flex items-start gap-2">{connectionStatus === 'testing' && <Loader2 className="mt-0.5 h-4 w-4 animate-spin" />}{connectionStatus === 'success' && <CheckCircle2 className="mt-0.5 h-4 w-4" />}{connectionStatus === 'error' && <XCircle className="mt-0.5 h-4 w-4" />}<span>{connectionMessage}</span></div>
                 </div>
               )}
             </div>
 
-            <div className="flex flex-col gap-3 border-t border-white/10 bg-black/45 px-5 py-4 sm:flex-row sm:justify-between">
+            <div className="flex flex-col gap-3 border-t border-white/10 bg-black/48 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex flex-col gap-2 sm:flex-row">
-                <button type="button" onClick={() => testConnection('quick')} disabled={connectionStatus === 'testing'} className={cn('inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold text-white transition', connectionStatus === 'testing' ? 'cursor-not-allowed bg-white/10 text-white/25' : 'bg-emerald-600 hover:bg-emerald-500')}>{connectionStatus === 'testing' && connectionTestMode === 'quick' ? <><Loader2 className="h-4 w-4 animate-spin" />快速测试中...</> : <><Sparkles className="h-4 w-4" />快速测试</>}</button>
-                <button type="button" onClick={() => testConnection('full')} disabled={connectionStatus === 'testing'} className={cn('inline-flex items-center justify-center gap-2 rounded-xl border px-4 py-2.5 text-sm font-semibold transition', connectionStatus === 'testing' ? 'cursor-not-allowed border-white/10 bg-white/5 text-white/25' : 'border-white/10 bg-white/[0.04] text-white/65 hover:bg-white/[0.08] hover:text-white')}>{connectionStatus === 'testing' && connectionTestMode === 'full' ? <><Loader2 className="h-4 w-4 animate-spin" />完整测试中...</> : <><Sparkles className="h-4 w-4" />完整测试</>}</button>
+                <button type="button" onClick={() => testConnection('quick')} disabled={connectionStatus === 'testing'} className={cn('xobi-soft-button h-10 justify-center px-4 text-sm font-semibold', connectionStatus === 'testing' && 'cursor-not-allowed opacity-45')}>{connectionStatus === 'testing' && connectionTestMode === 'quick' ? <><Loader2 className="h-4 w-4 animate-spin" />快速测试中...</> : <><Sparkles className="h-4 w-4" />快速测试</>}</button>
+                <button type="button" onClick={() => testConnection('full')} disabled={connectionStatus === 'testing'} className={cn('xobi-soft-button h-10 justify-center px-4 text-sm font-semibold', connectionStatus === 'testing' && 'cursor-not-allowed opacity-45')}>{connectionStatus === 'testing' && connectionTestMode === 'full' ? <><Loader2 className="h-4 w-4 animate-spin" />完整测试中...</> : <><Sparkles className="h-4 w-4" />完整测试</>}</button>
               </div>
 
               <div className="flex flex-col gap-2 sm:flex-row">
-                <button type="button" onClick={clearLocalSettings} className="rounded-xl border border-red-400/20 px-4 py-2.5 text-sm font-medium text-red-200 transition hover:bg-red-500/10 hover:text-white">清除本机设置</button>
-                <button type="button" onClick={closeSettings} className="rounded-xl border border-white/10 px-4 py-2.5 text-sm font-medium text-white/70 transition hover:bg-white/[0.06] hover:text-white">取消</button>
-                <button type="submit" className="ui-button ui-button-primary rounded-xl px-4 py-2.5 text-sm font-semibold text-white transition">保存设置</button>
+                <button type="button" onClick={clearLocalSettings} className="xobi-danger-action h-10 justify-center px-4 text-sm">清除本机设置</button>
+                <button type="button" onClick={closeSettings} className="xobi-soft-button h-10 justify-center px-4 text-sm">取消</button>
+                <button type="submit" className="xobi-primary-action h-10 justify-center px-5 text-sm">保存设置</button>
               </div>
             </div>
           </form>

@@ -1,1 +1,524 @@
 @import "tailwindcss";
+
+@layer components {
+  .xobi-kicker {
+    font-size: 0.6875rem;
+    font-weight: 700;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+  }
+
+  .xobi-archive-hero,
+  .xobi-settings-head {
+    background:
+      radial-gradient(circle at 12% 10%, rgba(16, 185, 129, 0.16), transparent 32%),
+      linear-gradient(135deg, rgba(182, 242, 20, 0.08), rgba(255, 255, 255, 0.025) 46%, rgba(94, 234, 212, 0.07));
+  }
+
+  .xobi-stat-tile {
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 1rem;
+    background: rgba(0, 0, 0, 0.32);
+    padding: 0.58rem 0.75rem;
+  }
+
+  .xobi-stat-tile p {
+    color: rgba(255, 255, 255, 0.38);
+  }
+
+  .xobi-stat-tile strong {
+    display: block;
+    margin-top: 0.15rem;
+    color: rgba(255, 255, 255, 0.92);
+    font-size: 1.45rem;
+    line-height: 1;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.04em;
+  }
+
+  .xobi-stat-good {
+    border-color: rgba(110, 231, 183, 0.2);
+    background: rgba(16, 185, 129, 0.1);
+  }
+
+  .xobi-stat-good strong { color: rgb(110, 231, 183); }
+
+  .xobi-stat-bad {
+    border-color: rgba(248, 113, 113, 0.18);
+    background: rgba(248, 113, 113, 0.09);
+  }
+
+  .xobi-stat-bad strong { color: rgb(252, 165, 165); }
+
+  .xobi-soft-button,
+  .xobi-primary-action,
+  .xobi-danger-action,
+  .xobi-icon-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    border-radius: 0.875rem;
+    transition: border-color 180ms ease, background 180ms ease, color 180ms ease, transform 180ms ease;
+  }
+
+  .xobi-soft-button {
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.055);
+    color: rgba(255, 255, 255, 0.68);
+  }
+
+  .xobi-soft-button:hover:not(:disabled) {
+    border-color: rgba(255, 255, 255, 0.18);
+    background: rgba(255, 255, 255, 0.095);
+    color: white;
+  }
+
+  .xobi-primary-action {
+    background: linear-gradient(135deg, rgb(52, 211, 153), rgb(163, 230, 53));
+    color: rgb(2, 6, 23);
+    font-weight: 800;
+  }
+
+  .xobi-primary-action:hover:not(:disabled) {
+    transform: translateY(-1px);
+  }
+
+  .xobi-danger-action {
+    border: 1px solid rgba(248, 113, 113, 0.24);
+    background: rgba(248, 113, 113, 0.1);
+    color: rgb(254, 202, 202);
+    font-weight: 600;
+  }
+
+  .xobi-danger-action:hover:not(:disabled) {
+    background: rgba(248, 113, 113, 0.16);
+    color: white;
+  }
+
+  .xobi-icon-button {
+    justify-content: center;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.06);
+    color: rgba(255, 255, 255, 0.52);
+  }
+
+  .xobi-icon-button:hover {
+    background: rgba(255, 255, 255, 0.11);
+    color: white;
+  }
+
+  .xobi-empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    border: 1px dashed rgba(255, 255, 255, 0.12);
+    border-radius: 1.5rem;
+    background: rgba(255, 255, 255, 0.025);
+    padding: 1rem;
+    text-align: center;
+    color: rgba(255, 255, 255, 0.42);
+    font-size: 0.875rem;
+    line-height: 1.6;
+  }
+
+  .xobi-history-card,
+  .xobi-history-image-card,
+  .xobi-detail-plate,
+  .xobi-settings-card {
+    position: relative;
+    overflow: hidden;
+    border-radius: 1.5rem;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: linear-gradient(145deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.018));
+  }
+
+  .xobi-history-card {
+    width: 100%;
+    padding: 0.85rem;
+    text-align: left;
+  }
+
+  .xobi-history-card:hover {
+    border-color: rgba(255, 255, 255, 0.18);
+    background: linear-gradient(145deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.026));
+  }
+
+  .xobi-history-card-active {
+    border-color: rgba(110, 231, 183, 0.45);
+    background: linear-gradient(145deg, rgba(16, 185, 129, 0.14), rgba(94, 234, 212, 0.04));
+    box-shadow: 0 0 30px rgba(16, 185, 129, 0.08);
+  }
+
+  .xobi-detail-plate,
+  .xobi-history-image-card,
+  .xobi-settings-card {
+    padding: 1rem;
+  }
+
+  .xobi-status-pill,
+  .xobi-mini-chip,
+  .xobi-save-pill {
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.055);
+    padding: 0.28rem 0.58rem;
+    font-size: 0.6875rem;
+    line-height: 1;
+    white-space: nowrap;
+  }
+
+  .xobi-status-done { background: rgba(16, 185, 129, 0.14); color: rgb(167, 243, 208); }
+  .xobi-status-failed { background: rgba(248, 113, 113, 0.14); color: rgb(254, 202, 202); }
+  .xobi-status-running { background: rgba(94, 234, 212, 0.12); color: rgb(153, 246, 228); }
+  .xobi-status-partial { background: rgba(255, 255, 255, 0.07); color: rgba(255, 255, 255, 0.62); }
+
+  .xobi-save-pill {
+    display: inline-flex;
+    justify-content: center;
+    border-radius: 0.875rem;
+    padding-block: 0.45rem;
+    background: rgba(255, 255, 255, 0.052);
+  }
+
+  .xobi-settings-modal {
+    display: flex;
+    flex-direction: column;
+    background:
+      radial-gradient(circle at 0% 0%, rgba(16, 185, 129, 0.1), transparent 32%),
+      rgb(8, 9, 9);
+  }
+
+  .xobi-settings-scroll {
+    min-height: 0;
+    flex: 1;
+  }
+
+  .xobi-field {
+    display: grid;
+    gap: 0.5rem;
+  }
+
+  .xobi-field > span,
+  .xobi-number-field > span {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    color: rgba(255, 255, 255, 0.66);
+    font-size: 0.75rem;
+    font-weight: 650;
+    letter-spacing: 0.01em;
+  }
+
+  .xobi-field > p {
+    color: rgba(255, 255, 255, 0.5);
+    font-size: 0.6875rem;
+    line-height: 1.65;
+  }
+
+  .xobi-number-field {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 7.5rem;
+    align-items: center;
+    gap: 0.75rem;
+    border-radius: 1rem;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.035);
+    padding: 0.65rem;
+  }
+
+  .xobi-input {
+    width: 100%;
+    border-radius: 0.95rem;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(0, 0, 0, 0.34);
+    padding: 0.72rem 0.85rem;
+    color: white;
+    outline: none;
+    transition: border-color 180ms ease, background 180ms ease, box-shadow 180ms ease;
+  }
+
+  .xobi-input::placeholder { color: rgba(255, 255, 255, 0.18); }
+  .xobi-input:hover { border-color: rgba(255, 255, 255, 0.18); }
+  .xobi-input:focus {
+    border-color: rgba(52, 211, 153, 0.72);
+    box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.12);
+    background: rgba(0, 0, 0, 0.48);
+  }
+
+  .xobi-input[type='number']::-webkit-outer-spin-button,
+  .xobi-input[type='number']::-webkit-inner-spin-button {
+    margin: 0;
+    opacity: 0.35;
+  }
+
+  .xobi-message {
+    border-radius: 1rem;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    padding: 0.9rem 1rem;
+    font-size: 0.875rem;
+    line-height: 1.6;
+  }
+
+  .xobi-message-success {
+    border-color: rgba(52, 211, 153, 0.24);
+    background: rgba(16, 185, 129, 0.1);
+    color: rgb(167, 243, 208);
+  }
+
+  .xobi-message-error {
+    border-color: rgba(248, 113, 113, 0.26);
+    background: rgba(248, 113, 113, 0.1);
+    color: rgb(254, 202, 202);
+  }
+
+  @media (max-width: 640px) {
+    .xobi-number-field {
+      grid-template-columns: 1fr;
+    }
+
+    .xobi-settings-card {
+      border-radius: 1.15rem;
+      padding: 0.85rem;
+    }
+
+    .xobi-settings-scroll {
+      max-height: none;
+      padding: 1rem;
+    }
+  }
+}
+
+@layer components {
+  .xobi-history-gallery-card {
+    padding: 0.65rem;
+  }
+
+  .xobi-history-cover {
+    position: relative;
+    aspect-ratio: 1 / 1;
+    overflow: hidden;
+    border-radius: 1.15rem;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background:
+      radial-gradient(circle at 20% 10%, rgba(16, 185, 129, 0.2), transparent 38%),
+      rgba(255, 255, 255, 0.04);
+  }
+
+  .xobi-history-cover::after {
+    display: none;
+  }
+
+  .xobi-history-cover-empty {
+    display: flex;
+    height: 100%;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.45rem;
+    color: rgba(255, 255, 255, 0.32);
+    font-size: 0.75rem;
+  }
+
+  .xobi-cover-kind,
+  .xobi-cover-status {
+    position: static;
+    z-index: auto;
+    display: inline-flex;
+    align-items: center;
+    min-height: 1.5rem;
+  }
+
+  .xobi-cover-kind {
+    border-radius: 999px;
+    padding: 0.3rem 0.55rem;
+    font-size: 0.625rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+  }
+
+  .xobi-cover-result {
+    background: rgba(52, 211, 153, 0.92);
+    color: rgb(2, 6, 23);
+  }
+
+  .xobi-cover-original {
+    background: rgba(255, 255, 255, 0.14);
+    color: rgba(255, 255, 255, 0.78);
+    backdrop-filter: blur(12px);
+  }
+
+  .xobi-cover-status {
+    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.28);
+  }
+
+  .xobi-history-thumb {
+    position: relative;
+    aspect-ratio: 1;
+    overflow: hidden;
+    border-radius: 0.8rem;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.045);
+  }
+
+  .xobi-history-thumb-empty {
+    background:
+      linear-gradient(135deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.018));
+  }
+}
+
+@layer components {
+  .xobi-history-gallery-stage {
+    user-select: none;
+    background:
+      radial-gradient(circle at 12% 0%, rgba(16, 185, 129, 0.12), transparent 34%),
+      radial-gradient(circle at 88% 12%, rgba(34, 211, 238, 0.07), transparent 30%),
+      linear-gradient(180deg, rgba(255, 255, 255, 0.018), rgba(255, 255, 255, 0.005));
+    animation: xobi-history-surface-in 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .xobi-history-masonry {
+    column-count: 2;
+    column-gap: 0.65rem;
+  }
+
+  .xobi-history-masonry-full {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+    gap: 0.55rem;
+    align-items: start;
+  }
+
+  .xobi-history-masonry > .xobi-history-card {
+    display: inline-block;
+    break-inside: avoid;
+    margin: 0 0 0.65rem;
+  }
+
+  .xobi-history-masonry-full > .xobi-history-card {
+    display: block;
+    margin: 0;
+  }
+
+  @media (max-width: 1180px) {
+    .xobi-history-masonry {
+      column-count: 1;
+    }
+  }
+
+  @media (min-width: 1600px) {
+    .xobi-history-masonry-full {
+      grid-template-columns: repeat(auto-fill, minmax(136px, 1fr));
+    }
+  }
+
+  @media (max-width: 900px) {
+    .xobi-history-masonry-full {
+      grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    }
+  }
+
+  @media (max-width: 640px) {
+    .xobi-history-masonry-full {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+
+  .xobi-history-gallery-card {
+    border-radius: 0.95rem;
+    padding: 0.38rem;
+    transform-origin: center;
+    contain: layout paint style;
+    content-visibility: auto;
+    contain-intrinsic-size: 220px 330px;
+    animation: xobi-history-card-in 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1), border-color 180ms ease, background 180ms ease, box-shadow 180ms ease;
+  }
+
+  .xobi-history-gallery-card:hover {
+    transform: translateY(-1px);
+  }
+
+  .xobi-history-card-selected::before {
+    content: '';
+    position: absolute;
+    inset: 0.32rem;
+    z-index: 3;
+    pointer-events: none;
+    border-radius: 0.8rem;
+    border: 1px solid rgba(182, 242, 20, 0.86);
+    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.45);
+  }
+
+
+  .xobi-history-detail-view {
+    animation: xobi-history-surface-in 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .xobi-history-selection-bar {
+    display: inline-flex;
+    position: absolute;
+    top: 0.75rem;
+    right: 0.75rem;
+    z-index: 10;
+    align-items: center;
+    gap: 0.35rem;
+    border: 1px solid rgba(182, 242, 20, 0.24);
+    border-radius: 999px;
+    background: rgba(11, 18, 15, 0.88);
+    padding: 0.22rem;
+    color: rgba(236, 253, 245, 0.76);
+    font-size: 0.6875rem;
+    box-shadow: 0 12px 34px rgba(0, 0, 0, 0.3);
+    animation: xobi-history-toolbar-in 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .xobi-history-selection-bar span {
+    padding: 0 0.45rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .xobi-history-selection-bar button {
+    border-radius: 999px;
+    padding: 0.32rem 0.58rem;
+    transition: background 160ms ease, color 160ms ease;
+  }
+
+  .xobi-history-selection-bar button:hover {
+    background: rgba(182, 242, 20, 0.14);
+    color: white;
+  }
+
+  .xobi-history-gallery-card .xobi-history-thumb {
+    border-radius: 0.5rem;
+  }
+
+  .xobi-history-gallery-card .xobi-mini-chip {
+    border-radius: 0.6rem;
+    padding: 0.3rem 0.35rem;
+    text-align: center;
+  }
+
+  @keyframes xobi-history-surface-in {
+    from { opacity: 0; transform: translateY(10px) scale(0.992); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
+
+  @keyframes xobi-history-card-in {
+    from { opacity: 0; transform: translateY(8px) scale(0.985); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
+
+  @keyframes xobi-history-toolbar-in {
+    from { opacity: 0; transform: translateY(-4px) scale(0.96); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
+
+  @media (max-width: 640px) {
+    .xobi-history-selection-bar {
+      left: 0.5rem;
+      right: auto;
+      top: 0.5rem;
+    }
+  }
+}

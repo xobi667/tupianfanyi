@@ -1,17 +1,22 @@
 # Local/runtime artifacts
 资源/
 *.log
-mcp-*.png
-dev*.log
+/mcp-*.png
+codex/mcp-*.png
+/dev*.log
+
 # Project caches/dependencies
 project/node_modules/
 project/.next/
 project/.codex-logs/
 project/*.tsbuildinfo
+
 # Environment secrets
 .env
 .env.*
 !.env.example
+
+# Python/cache helpers
 __pycache__/
 *.pyc
 project/scripts/__pycache__/
