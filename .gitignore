@@ -1,0 +1,32 @@
+# Local/runtime artifacts
+资源/
+*.log
+/mcp-*.png
+codex/mcp-*.png
+/dev*.log
+/output/
+/fanyi_report.txt
+/fanyi_failed.txt
+
+# Personal agent configuration
+/.claude/
+/.codex/
+/.publish-verify/
+
+# Project caches/dependencies
+project/node_modules/
+project/.next/
+project/.codex-logs/
+project/*.tsbuildinfo
+/project/public/showcase/
+/project/public/ui-assets/
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Python/cache helpers
+__pycache__/
+*.pyc
+project/scripts/__pycache__/
