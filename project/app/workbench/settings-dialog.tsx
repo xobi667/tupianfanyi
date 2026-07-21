@@ -86,7 +86,7 @@ export function SettingsDialog({
 
   return (
     <div
-      className="ui-modal-backdrop fixed inset-0 z-50 flex items-center justify-center px-3 py-5 backdrop-blur-xl sm:px-4 sm:py-8"
+      className="ui-modal-backdrop fixed inset-0 z-[80] flex items-center justify-center px-3 py-5 backdrop-blur-xl sm:px-4 sm:py-8"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) onClose();
       }}

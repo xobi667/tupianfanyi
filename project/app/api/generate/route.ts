@@ -776,6 +776,13 @@ function buildOpenAiImagesPayload(body: Partial<GatewayGenerateRequest>) {
     throw new Error('Image requests require a text prompt.');
   }
 
+  const requestedAspectRatio = typeof body.generationConfig?.aspectRatio === 'string'
+    ? body.generationConfig.aspectRatio
+    : typeof (body.generationConfig?.imageConfig as { aspectRatio?: unknown } | undefined)?.aspectRatio === 'string'
+      ? (body.generationConfig?.imageConfig as { aspectRatio: string }).aspectRatio
+      : '';
+  const size = getOpenAiImageSizeForAspectRatio(requestedAspectRatio);
+
   if (imageParts.length === 0) {
     return {
       endpoint: 'generations' as const,
@@ -783,7 +790,7 @@ function buildOpenAiImagesPayload(body: Partial<GatewayGenerateRequest>) {
         model: body.model?.trim(),
         prompt,
         n: 1,
-        size: 'auto',
+        size,
       }),
     };
   }
@@ -798,7 +805,7 @@ function buildOpenAiImagesPayload(body: Partial<GatewayGenerateRequest>) {
   formData.append('model', body.model?.trim() ?? '');
   formData.append('prompt', prompt);
   formData.append('n', '1');
-  formData.append('size', 'auto');
+  formData.append('size', size);
 
   return {
     endpoint: 'edits' as const,
@@ -1099,6 +1106,18 @@ async function nodeRequestFetch(input: string, init: NodeRequestFetchInit = {}, 
     if (body !== undefined) req.write(body);
     req.end();
   });
+}
+
+function getOpenAiImageSizeForAspectRatio(aspectRatio: string) {
+  const [rawWidth, rawHeight] = aspectRatio.split(':').map(Number);
+  if (!Number.isFinite(rawWidth) || !Number.isFinite(rawHeight) || rawWidth <= 0 || rawHeight <= 0) {
+    return 'auto';
+  }
+
+  const ratio = rawWidth / rawHeight;
+  if (ratio > 1.12) return '1536x1024';
+  if (ratio < 0.9) return '1024x1536';
+  return '1024x1024';
 }
 
 async function guardedFetch(input: string, init: NodeRequestFetchInit, label: string) {
@@ -2622,6 +2641,26 @@ export async function POST(request: Request) {
           error: `upstream HTTP ${upstreamResponse.status}`,
         });
         return buildUpstreamErrorResponse(requestId, upstreamResponse, rawText, rawBodyForError, settings.apiBaseUrl);
+      }
+
+      if (isImageRequest(body) && body.allowImageTransportFallback === false) {
+        const unsupportedMessage = `OpenAI chat/completions 生图接口不可用 (${upstreamResponse.status})。为避免跨接口重复提交和重复扣费，已停止自动切换到 generateContent。`;
+        await appendGenerateLifecycleLog({
+          requestId,
+          stage: 'request-transport-unsupported',
+          model: lifecycleModel,
+          upstreamUrl: openAiTarget,
+          status: upstreamResponse.status,
+          durationMs,
+          error: unsupportedMessage,
+        });
+        return NextResponse.json(
+          { error: { message: unsupportedMessage } },
+          {
+            status: upstreamResponse.status,
+            headers: buildDebugHeaders(requestId),
+          },
+        );
       }
 
       console.log(`${logPrefix} OpenAI chat/completions unavailable, falling back to generateContent`);

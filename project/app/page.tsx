@@ -144,6 +144,7 @@ import {
   type HistoryTaskRecord,
 } from './workbench/history-client';
 import { SettingsDialog } from './workbench/settings-dialog';
+import { ImageStudio } from './workbench/image-studio';
 import { StartConfirmDialog, type StartConfirmDialogState } from './workbench/start-confirm-dialog';
 import { TaskContextMenu } from './workbench/task-context-menu';
 import { TaskPreviewDialog } from './workbench/task-preview-dialog';
@@ -729,6 +730,7 @@ export default function ImageTranslator() {
     useState<GatewaySettings>(DEFAULT_SETTINGS);
   const [settingsHydrated, setSettingsHydrated] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [imageStudioOpen, setImageStudioOpen] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>('idle');
@@ -1310,7 +1312,7 @@ export default function ImageTranslator() {
 
     const refreshPromise = (async () => {
     try {
-      const response = await fetch(`/api/history?preview=1&limit=${HISTORY_LIST_PAGE_SIZE}`);
+      const response = await fetch(`/api/history?scope=translation&preview=1&limit=${HISTORY_LIST_PAGE_SIZE}`);
       const parsed = await response.json();
       if (!response.ok) {
         throw new Error(parsed?.error?.message ?? '历史记录读取失败。');
@@ -1375,7 +1377,7 @@ export default function ImageTranslator() {
     if (!historyHasMore || historyListCursor === null || historyLoading) return;
     setHistoryLoading(true);
     try {
-      const response = await fetch(`/api/history?preview=1&limit=${HISTORY_LIST_PAGE_SIZE}&cursor=${historyListCursor}`);
+      const response = await fetch(`/api/history?scope=translation&preview=1&limit=${HISTORY_LIST_PAGE_SIZE}&cursor=${historyListCursor}`);
       const parsed = await response.json();
       if (!response.ok) throw new Error(parsed?.error?.message ?? '历史记录读取失败。');
       const nextTasks = (parsed.tasks ?? []) as HistoryTaskRecord[];
@@ -4246,6 +4248,10 @@ export default function ImageTranslator() {
                 <button type="button" onClick={openFolderPicker} disabled={isProcessingBatch || isUploading} aria-label="添加文件夹" title="添加文件夹" className="ui-icon-action disabled:opacity-40">
                   <FolderUp className="h-4 w-4" aria-hidden="true" />
                 </button>
+                <button type="button" onClick={() => setImageStudioOpen(true)} aria-label="打开生图工作台" title="生图工作台" className="ui-button px-3 text-xs font-medium">
+                  <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
+                  生图
+                </button>
                 <LanguageSelect
                   value={targetLanguage}
                   options={LANGUAGE_OPTIONS}
@@ -4284,6 +4290,10 @@ export default function ImageTranslator() {
                 <span className="text-sm font-semibold leading-none text-[var(--xobi-text)]">xobi</span>
               </div>
               <div className="ml-auto flex items-center gap-1.5 sm:gap-2">
+                <button type="button" onClick={() => setImageStudioOpen(true)} aria-label="打开生图工作台" title="生图工作台" className="ui-button px-3 text-xs font-medium">
+                  <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
+                  生图
+                </button>
                 <button type="button" onClick={() => void openHistoryPanel()} aria-label={`打开翻译历史，共 ${historyTotalDisplayCount} 个任务`} aria-busy={historyLoading} title="翻译历史" className="ui-icon-action ui-history-orbit-button" data-has-history={historyTotalDisplayCount > 0}>
                   <svg className="ui-history-orbit-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                     <path className="ui-history-orbit-ring" d="M6.6 6.5A7.5 7.5 0 1 1 4.5 12" />
@@ -4592,6 +4602,15 @@ export default function ImageTranslator() {
           onClear={clearLocalSettings}
           onTestConnection={testConnection}
           onUpdateDraftSettings={updateDraftSettings}
+        />
+      )}
+
+      {imageStudioOpen && (
+        <ImageStudio
+          settings={settings}
+          suspended={settingsOpen}
+          onClose={() => setImageStudioOpen(false)}
+          onOpenSettings={openSettings}
         />
       )}
     </>

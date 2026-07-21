@@ -39,6 +39,11 @@ export interface GatewayGenerateRequest {
   requestKind?: 'text' | 'image';
   debugLabel?: string;
   attemptLabel?: string;
+  /**
+   * Whether an unsupported OpenAI chat image transport may fall back to a
+   * generateContent request. Defaults to the legacy behavior (`true`).
+   */
+  allowImageTransportFallback?: boolean;
   /** Stable per-image operation id used by the local job API to prevent duplicate paid submissions. */
   operationId?: string;
 }

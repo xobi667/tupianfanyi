@@ -260,6 +260,42 @@ export async function fetchGenerateApiResponse(
   return pollGenerateJob(jobId, signal);
 }
 
+/**
+ * Reads or waits for an already-submitted image job without ever creating a
+ * new paid upstream request. This is used when the browser lost the original
+ * polling connection after submission.
+ */
+export async function recoverGenerateApiResponse(
+  operationId: string,
+  signal?: AbortSignal,
+) {
+  if (!operationId) {
+    throw new Error('缺少原任务 ID，无法安全恢复。');
+  }
+
+  let existingResponse: Response;
+  try {
+    existingResponse = await fetchJobStatus(operationId, signal);
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') throw error;
+    throw new Error(`无法查询原生图任务 ${operationId}；本次没有发起新请求。`);
+  }
+
+  if (existingResponse.status === 404) {
+    throw new Error(`原生图任务 ${operationId} 的恢复缓存不存在；为避免重复扣费，本次没有重新提交。`);
+  }
+
+  const existing = await readJobPayload(existingResponse);
+  if (!existingResponse.ok && existingResponse.status !== 202) {
+    throw new Error(
+      existing.error?.message ??
+        `原生图任务查询失败 (${existingResponse.status})；本次没有重新提交。`,
+    );
+  }
+
+  return pollGenerateJob(existing.job?.id ?? operationId, signal);
+}
+
 export async function acknowledgeGenerateJobFamily(operationId?: string) {
   if (!operationId) return;
 

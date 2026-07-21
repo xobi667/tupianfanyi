@@ -675,16 +675,24 @@ async function readIndex() {
           sanitizeTaskRecord(repaired.task),
         );
       }
-      const hasAnyOriginal = await Promise.all(
-        repaired.task.images.map((image) =>
-          pathExists(
-            image.originalPath
-              ? path.join(RESOURCE_DIR, image.originalPath)
-              : undefined,
-          ),
-        ),
+      const hasAnyStoredImage = await Promise.all(
+        repaired.task.images.map(async (image) => {
+          const [hasOriginal, hasResult] = await Promise.all([
+            pathExists(image.originalPath ? path.join(RESOURCE_DIR, image.originalPath) : undefined),
+            pathExists(image.resultPath ? path.join(RESOURCE_DIR, image.resultPath) : undefined),
+          ]);
+          return hasOriginal || hasResult;
+        }),
       );
-      if (repaired.task.images.length > 0 && !hasAnyOriginal.some(Boolean)) {
+      const hasRecoverableGeneration = repaired.task.images.some((image) => (
+        Boolean(image.generationOperationId)
+        && ['generating', 'error', 'paused'].includes(image.status)
+      ));
+      if (
+        repaired.task.images.length > 0
+        && !hasAnyStoredImage.some(Boolean)
+        && !hasRecoverableGeneration
+      ) {
         return null;
       }
       const updatedAt =
@@ -1063,6 +1071,12 @@ export async function GET(request: NextRequest) {
   const taskId = request.nextUrl.searchParams.get('taskId');
   const includeData = request.nextUrl.searchParams.get('includeData') === '1';
   const includePreview = request.nextUrl.searchParams.get('preview') === '1';
+  const previewLimit = parseBoundedNumber(
+    request.nextUrl.searchParams.get('previewLimit'),
+    4,
+    40,
+  );
+  const scope = request.nextUrl.searchParams.get('scope');
   const cursor = parseBoundedNumber(request.nextUrl.searchParams.get('cursor'), 0, Number.MAX_SAFE_INTEGER);
   const listLimit = parseBoundedNumber(
     request.nextUrl.searchParams.get('limit'),
@@ -1071,7 +1085,12 @@ export async function GET(request: NextRequest) {
   );
 
   if (!taskId) {
-    const tasks = await readIndex();
+    const tasks = (await readIndex()).filter((task) => {
+      const isGenerateMode = task.mode === 'generate' || task.mode.startsWith('generate-');
+      if (scope === 'generate') return isGenerateMode;
+      if (scope === 'translation') return !isGenerateMode;
+      return true;
+    });
     const pagedTasks = tasks.slice(cursor, cursor + listLimit);
     const nextCursor = cursor + pagedTasks.length;
     const hasMore = nextCursor < tasks.length;
@@ -1088,7 +1107,7 @@ export async function GET(request: NextRequest) {
     const tasksWithPreview = await runWithConcurrencyLimit(
       pagedTasks.map((task) => async () => ({
         ...sanitizeTaskRecord(task),
-        previewImages: await buildTaskPreviewImages(task),
+        previewImages: await buildTaskPreviewImages(task, previewLimit),
       })),
       PREVIEW_READ_CONCURRENCY,
     );
